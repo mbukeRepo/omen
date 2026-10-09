@@ -137,6 +137,14 @@ export interface Book {
   ts: number;
 }
 
+export interface SpotBalance {
+  coin: string;
+  total: string;
+  hold: string;
+  /** Cost basis in USDC; avg entry = entryNtl / total. */
+  entryNtl?: string;
+}
+
 export interface OpenOrder {
   coin: string;
   oid: number;
@@ -177,8 +185,8 @@ export class HyperliquidInfo {
     return { bids: toSide(raw.levels?.[0] ?? []), asks: toSide(raw.levels?.[1] ?? []), ts: raw.time ?? Date.now() };
   }
 
-  async spotBalances(user: string): Promise<{ coin: string; total: string; hold: string }[]> {
-    const res = await this.info<{ balances: { coin: string; total: string; hold: string }[] }>({
+  async spotBalances(user: string): Promise<SpotBalance[]> {
+    const res = await this.info<{ balances: SpotBalance[] }>({
       type: "spotClearinghouseState",
       user,
     });

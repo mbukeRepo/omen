@@ -127,12 +127,22 @@ function describeMove(from: number, to: number): string {
   return `${sign}${pp.toFixed(2)}pp, ${sign}${pct.toFixed(1)}%`;
 }
 
+interface Position {
+  outcome: number;
+  side: Side;
+  sz: number;
+  /** Average entry price from the clearinghouse cost basis, when reported. */
+  entryPx: number | null;
+}
+
 export class Watcher {
   private readonly tracked = new Map<number, Tracked>();
   private readonly tg: Telegram | null;
   private meta: OutcomeMeta = { outcomes: [], questions: [] };
   private lastMetaFetch = 0;
   private lastHeartbeat = Date.now();
+  /** Held outcome tokens by balance coin ("+N"); only populated when opts.user is set. */
+  private positions = new Map<string, Position>();
 
   constructor(
     private readonly info: HyperliquidInfo,
@@ -222,9 +232,80 @@ export class Watcher {
     return [yes, no].filter((x): x is string => x !== null);
   }
 
+  private async fetchPositions(): Promise<Map<string, Position>> {
+    const out = new Map<string, Position>();
+    const balances = await this.info.spotBalances(this.opts.user!);
+    for (const b of balances) {
+      if (!b.coin.startsWith("+")) continue;
+      const sz = Number(b.total);
+      if (!(sz > 0)) continue;
+      const { outcome, side } = decodeCoin(b.coin);
+      const entryNtl = b.entryNtl !== undefined ? Number(b.entryNtl) : NaN;
+      out.set(b.coin, { outcome, side, sz, entryPx: Number.isFinite(entryNtl) ? entryNtl / sz : null });
+    }
+    return out;
+  }
+
+  private describePosition(p: Position, currentMid?: number): string {
+    let s = `${p.sz} ${sideName(p.side)}`;
+    if (p.entryPx !== null) s += ` @ avg ${p.entryPx.toFixed(4)}`;
+    if (currentMid !== undefined) {
+      s += ` | now ${currentMid.toFixed(4)}`;
+      if (p.entryPx !== null) {
+        const pnl = (currentMid - p.entryPx) * p.sz;
+        s += ` | uPnL ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDC`;
+      }
+    }
+    return s;
+  }
+
+  /** "position: 100 YES @ avg 0.5500 | now 0.6200 | uPnL +7.00 USDC" lines for a market we hold. */
+  private positionLines(outcome: number): string[] {
+    const t = this.tracked.get(outcome);
+    const lines: string[] = [];
+    for (const p of this.positions.values()) {
+      if (p.outcome !== outcome) continue;
+      const mid = p.side === YES ? t?.last : t?.lastNo;
+      lines.push(`position: ${this.describePosition(p, mid)}`);
+    }
+    return lines;
+  }
+
+  /** Diff held positions against the last poll; announce opens, size changes, and closes. */
+  private async checkPositions(mids: Record<string, string>): Promise<void> {
+    const next = await this.fetchPositions();
+    for (const [coin, p] of next) {
+      // A position in a market we weren't watching yet pulls that market into the watch set.
+      if (!this.tracked.has(p.outcome)) {
+        const raw = mids[encodeCoin(p.outcome, YES)];
+        if (raw !== undefined) {
+          const rawNo = mids[encodeCoin(p.outcome, NO)];
+          this.track(p.outcome, Number(raw), rawNo !== undefined ? Number(rawNo) : undefined);
+        }
+      }
+      const t = this.tracked.get(p.outcome);
+      const label = t ? `${t.label}  [#${p.outcome}]` : `#${p.outcome}`;
+      const mid = p.side === YES ? t?.last : t?.lastNo;
+      const prev = this.positions.get(coin);
+      if (!prev) {
+        this.notify(`📥 position opened: ${label}\n${this.describePosition(p, mid)}`);
+      } else if (Math.abs(p.sz - prev.sz) > 1e-9) {
+        const verb = p.sz > prev.sz ? "increased" : "reduced";
+        this.notify(`${p.sz > prev.sz ? "📥" : "📤"} position ${verb}: ${label}\n${prev.sz} → ${this.describePosition(p, mid)}`);
+      }
+    }
+    for (const [coin, prev] of this.positions) {
+      if (next.has(coin)) continue;
+      const t = this.tracked.get(prev.outcome);
+      const label = t ? `${t.label}  [#${prev.outcome}]` : `#${prev.outcome}`;
+      this.notify(`📤 position closed: ${label}\nwas ${this.describePosition(prev)}`);
+    }
+    this.positions = next;
+  }
+
   /** Full detail block for one market, used by startup, alerts and heartbeats. */
   private async detailBlock(t: Tracked, headline: string): Promise<string> {
-    const lines = [headline, ...(await this.topOfBook(t.outcome))];
+    const lines = [headline, ...(await this.topOfBook(t.outcome)), ...this.positionLines(t.outcome)];
     if (t.last !== t.start) {
       lines.push(`session: YES ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})`);
     }
@@ -311,7 +392,9 @@ export class Watcher {
         return [
           `• ${t.label}  [#${t.outcome}]`,
           `  YES ${t.last.toFixed(4)} | NO ${t.lastNo.toFixed(4)}`,
-          `  session: YES ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})${exp ? `\n  ${exp}` : ""}`,
+          `  session: YES ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})`,
+          ...this.positionLines(t.outcome).map((l) => `  ${l}`),
+          ...(exp ? [`  ${exp}`] : []),
         ].join("\n");
       });
     this.notify(
@@ -335,6 +418,10 @@ export class Watcher {
       console.log(`watching #${t.outcome} YES ${t.start.toFixed(4)} / NO ${t.startNo.toFixed(4)} — ${t.label}`);
     }
     if (this.tracked.size === 0) throw new Error("nothing to watch");
+
+    // Baseline the held positions before the loop so startup shows them
+    // as holdings rather than as "position opened" alerts.
+    if (this.opts.user) this.positions = await this.fetchPositions();
 
     const header =
       `👁 hip4 watch started — ${this.tracked.size} market${this.tracked.size === 1 ? "" : "s"}, ` +
@@ -362,6 +449,7 @@ export class Watcher {
         if (autoAdd && Date.now() - this.lastMetaFetch > META_REFRESH_MS) await this.refreshMeta();
         const m = await this.info.allMids();
         await this.tick(m);
+        if (this.opts.user) await this.checkPositions(m);
         if (autoAdd) await this.addNewListings(m);
         this.heartbeat();
         process.stdout.write(".");

@@ -239,12 +239,18 @@ program
       held.map(async (b) => {
         const { outcome, side } = decodeCoin(b.coin);
         const mid = mids[encodeCoin(outcome, side)];
+        const sz = Number(b.total);
+        const entryNtl = b.entryNtl !== undefined ? Number(b.entryNtl) : NaN;
+        const entryPx = Number.isFinite(entryNtl) && sz > 0 ? entryNtl / sz : null;
+        const upnl = entryPx !== null && mid !== undefined ? (Number(mid) - entryPx) * sz : null;
         return {
           coin: b.coin,
           token: sideName(side),
           sz: b.total,
           hold: b.hold,
+          entry: entryPx !== null ? entryPx.toFixed(4) : "?",
           mid: mid ?? "?",
+          uPnL: upnl !== null ? `${upnl >= 0 ? "+" : ""}${upnl.toFixed(2)}` : "?",
           market: (await labelFor(meta, outcome)).slice(0, 60),
         };
       }),

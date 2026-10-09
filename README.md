@@ -55,6 +55,16 @@ patterns. Pattern entries re-match every 10 minutes, so recurring markets (hourl
 binaries, weekly sports) keep getting picked up as they list; URL/index entries pin one
 specific market.
 
+### Position monitoring
+
+With `--positions` (the signing wallet) or `--user <address>`, the watcher also polls the
+wallet's outcome-token holdings every tick and notifies on: 📥 position opened or increased,
+📤 reduced or closed — with size, average entry (from the clearinghouse cost basis), current
+mid and unrealized PnL. Markets you take a position in are pulled into the watch set
+automatically, and every alert/heartbeat for a held market carries a
+`position: 100 YES @ avg 0.5500 | now 0.6200 | uPnL +7.00 USDC` line. The one-shot
+`hip4 positions` table shows the same entry/uPnL columns.
+
 `watch` polls YES mids and posts to the Telegram channel whenever a market moves at
 least `--delta` since the **last alert** (the baseline resets each time it fires, so a
 slow drift alerts once per threshold-worth of movement, not every tick). `--delta` is a
