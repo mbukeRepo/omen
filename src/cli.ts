@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { ExchangeClient, HttpTransport } from "@nktkas/hyperliquid";
 import { loadConfig } from "./config.js";
 import { loadAccount } from "./wallet.js";
+import { Watcher } from "./watch.js";
 import {
   HyperliquidInfo,
   NO,
@@ -250,6 +251,40 @@ program
     );
     console.table(rows);
   });
+
+program
+  .command("watch")
+  .description("Track YES mids and send a Telegram channel alert when a market moves past a threshold")
+  .argument("[outcomes...]", "outcome indices to watch (from `hip4 markets`)")
+  .option("-d, --delta <pct>", "alert threshold: relative % move of the YES mid since the last alert", "5")
+  .option("--pp", "interpret --delta as probability percentage points instead of relative %")
+  .option("-i, --interval <secs>", "poll interval in seconds", "30")
+  .option("--all", "watch every live outcome market (auto-adds new listings)")
+  .option("--positions", "watch the outcomes the signing wallet holds tokens in")
+  .option("--user <address>", "watch the outcomes this address holds tokens in")
+  .option("--heartbeat <mins>", "periodic digest of watched markets to the channel; 0 disables", "60")
+  .action(
+    async (
+      outcomes: string[],
+      opts: { delta: string; pp?: boolean; interval: string; all?: boolean; positions?: boolean; user?: string; heartbeat: string },
+    ) => {
+      const delta = Number(opts.delta);
+      const intervalSecs = Number(opts.interval);
+      if (!(delta > 0)) throw new Error(`--delta must be > 0, got "${opts.delta}"`);
+      if (!(intervalSecs >= 2)) throw new Error(`--interval must be >= 2 seconds, got "${opts.interval}"`);
+      const user = opts.user ?? (opts.positions ? await signerAddress() : null);
+      const watcher = new Watcher(info, {
+        intervalSecs,
+        delta,
+        asPoints: Boolean(opts.pp),
+        all: Boolean(opts.all),
+        user,
+        heartbeatMins: Number(opts.heartbeat),
+        telegram: cfg.telegram,
+      });
+      await watcher.run(outcomes.map((o) => Number.parseInt(o, 10)));
+    },
+  );
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   console.error(err instanceof Error ? err.message : String(err));

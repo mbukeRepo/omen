@@ -19,6 +19,7 @@ cp .env.example .env   # fill in Turnkey credentials
 | `TURNKEY_SIGN_WITH` | Wallet account address (`0x…`) or private key id to sign with |
 | `HL_TESTNET` | `true` to target Hyperliquid testnet |
 | `HL_PRIVATE_KEY` | Dev-only fallback signer when Turnkey vars are unset |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Channel alerts for `watch` (bot must be a channel admin; chat id is `@name` or `-100…`) |
 
 ## Commands
 
@@ -34,6 +35,25 @@ npm run hip4 -- orders                      # open orders
 npm run hip4 -- cancel 42 yes 123456789     # cancel by oid
 npm run hip4 -- positions                   # held outcome tokens
 ```
+
+### Watch + Telegram alerts
+
+```sh
+npm run hip4 -- watch 10095 10097           # watch specific outcomes
+npm run hip4 -- watch --positions           # watch markets the signing wallet holds
+npm run hip4 -- watch --user 0xabc…         # watch markets an address holds
+npm run hip4 -- watch --all -d 10           # whole universe, alert on ≥10% moves
+npm run hip4 -- watch 10095 -d 3 --pp -i 10 # ≥3 probability points, poll every 10s
+```
+
+`watch` polls YES mids and posts to the Telegram channel whenever a market moves at
+least `--delta` since the **last alert** (the baseline resets each time it fires, so a
+slow drift alerts once per threshold-worth of movement, not every tick). `--delta` is a
+relative % of the YES mid by default; pass `--pp` to use absolute probability percentage
+points instead — better for markets near 0 or 1, where relative % gets twitchy. It also
+notifies when a watched market stops quoting (resolved/delisted), when `--all` picks up a
+new listing, and sends an hourly digest (`--heartbeat 0` to disable). Without Telegram
+env vars it still runs, logging alerts to the console.
 
 Prices are probabilities in `(0, 1)`; sizes are contracts (each pays 1 USDC if it settles in
 your favor).

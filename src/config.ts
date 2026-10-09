@@ -14,6 +14,8 @@ export interface Config {
   } | null;
   /** Dev-only fallback signer; used when Turnkey is not configured. */
   rawPrivateKey: `0x${string}` | null;
+  /** Telegram channel notifications (optional; `watch` degrades to console-only). */
+  telegram: { token: string; chatId: string } | null;
 }
 
 export function loadConfig(): Config {
@@ -34,10 +36,14 @@ export function loadConfig(): Config {
 
   const rawKey = process.env.HL_PRIVATE_KEY;
 
+  const tgToken = process.env.TELEGRAM_BOT_TOKEN ?? "";
+  const tgChatId = process.env.TELEGRAM_CHAT_ID ?? "";
+
   return {
     hlApiUrl,
     testnet,
     turnkey: turnkeyConfigured ? tk : null,
     rawPrivateKey: rawKey && rawKey.startsWith("0x") ? (rawKey as `0x${string}`) : null,
+    telegram: tgToken !== "" && tgChatId !== "" ? { token: tgToken, chatId: tgChatId } : null,
   };
 }
