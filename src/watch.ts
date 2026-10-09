@@ -74,7 +74,8 @@ export function resolveSlug(meta: OutcomeMeta, spec: SlugSpec): number | null {
 interface Tracked {
   outcome: number;
   label: string;
-  expiry: string | null;
+  expiryMs: number | null;
+  url: string | null;
   start: number; // YES mid at session start (for heartbeat digests)
   baseline: number; // YES mid at last alert — alerts measure moves from here
   last: number;
@@ -82,8 +83,33 @@ interface Tracked {
 
 const META_REFRESH_MS = 10 * 60_000;
 
-function fmtExpiry(ms: number | null): string | null {
-  return ms ? `${new Date(ms).toISOString().slice(0, 16)} UTC` : null;
+const MONTH_NAMES = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/** "expires 2026-10-10T06:00 UTC (in 17h 10m)", or null when unknown. */
+function expiryLine(expiryMs: number | null): string | null {
+  if (!expiryMs) return null;
+  const stamp = `${new Date(expiryMs).toISOString().slice(0, 16)} UTC`;
+  const ms = expiryMs - Date.now();
+  if (ms <= 0) return `expires ${stamp} (settling)`;
+  const h = Math.floor(ms / 3_600_000);
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  const left = h >= 48 ? `${Math.floor(h / 24)}d ${h % 24}h` : `${h}h ${m}m`;
+  return `expires ${stamp} (in ${left})`;
+}
+
+/** Rebuild the app.hyperliquid.xyz trade URL for daily price binaries; null for other market types. */
+export function marketUrl(o: HlOutcome): string | null {
+  const d = parseDescription(o.description);
+  const isTemplate = o.name === "template:binaryPrice" || o.name === "template:binaryPriceExternal";
+  const isClass = d.class === "priceBinary";
+  if (!isTemplate && !isClass) return null;
+  const underlying = (isTemplate ? d.perp : d.underlying) ?? "";
+  const threshold = (isTemplate ? d.threshold : d.targetPrice) ?? "";
+  const time = (isTemplate ? d.time : d.expiry) ?? "";
+  const m = time.match(/^\d{4}(\d{2})(\d{2})-(\d{4})$/);
+  if (!underlying || !threshold || !m) return null;
+  const mon = MONTH_NAMES[Number(m[1]) - 1];
+  return `https://app.hyperliquid.xyz/trade/${underlying.toLowerCase()}-above-${threshold.replace(/\D/g, "")}-yes-${mon}-${m[2]}-${m[3]}`;
 }
 
 function describeMove(from: number, to: number): string {
@@ -160,7 +186,8 @@ export class Watcher {
     const t: Tracked = {
       outcome,
       label: o ? describeOutcome(o, this.meta.questions) : `outcome ${outcome}`,
-      expiry: fmtExpiry(o ? outcomeExpiryMs(o, this.meta.questions) : null),
+      expiryMs: o ? outcomeExpiryMs(o, this.meta.questions) : null,
+      url: o ? marketUrl(o) : null,
       start: mid,
       baseline: mid,
       last: mid,
@@ -169,46 +196,77 @@ export class Watcher {
     return t;
   }
 
+  /** Live top of book for the YES token, e.g. "bid 0.5800 x 220 | ask 0.5900 x 64". */
+  private async topOfBook(outcome: number): Promise<string | null> {
+    try {
+      const b = await this.info.l2Book(encodeCoin(outcome, YES));
+      const fmt = (l?: { px: number; sz: number }) => (l ? `${l.px.toFixed(4)} x ${l.sz}` : "—");
+      return `bid ${fmt(b.bids[0])} | ask ${fmt(b.asks[0])}`;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Full detail block for one market, used by startup, alerts and heartbeats. */
+  private async detailBlock(t: Tracked, headline: string): Promise<string> {
+    const lines = [headline];
+    const book = await this.topOfBook(t.outcome);
+    if (book) lines.push(book);
+    if (t.last !== t.start) lines.push(`session: ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})`);
+    const exp = expiryLine(t.expiryMs);
+    if (exp) lines.push(exp);
+    if (t.url) lines.push(t.url);
+    return lines.join("\n");
+  }
+
   private async refreshMeta(): Promise<void> {
     this.meta = await this.info.outcomeMeta();
     this.lastMetaFetch = Date.now();
   }
 
-  private tick(mids: Record<string, string>): void {
+  private async tick(mids: Record<string, string>): Promise<void> {
     for (const t of [...this.tracked.values()]) {
       const raw = mids[encodeCoin(t.outcome, YES)];
       if (raw === undefined) {
-        this.notify(`🏁 #${t.outcome} ${t.label}\nno longer quoted (resolved or delisted) — last YES ${t.last.toFixed(4)}`);
+        this.notify(
+          [
+            `🏁 ${t.label}  [#${t.outcome}]`,
+            `no longer quoted — resolved or delisted`,
+            `last YES ${t.last.toFixed(4)} | session: ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})`,
+            ...(t.url ? [t.url] : []),
+          ].join("\n"),
+        );
         this.tracked.delete(t.outcome);
         continue;
       }
       const mid = Number(raw);
+      const prevBaseline = t.baseline;
       t.last = mid;
-      const movedPp = Math.abs(mid - t.baseline) * 100;
-      const movedPct = t.baseline > 0 ? (Math.abs(mid - t.baseline) / t.baseline) * 100 : Number.POSITIVE_INFINITY;
+      const movedPp = Math.abs(mid - prevBaseline) * 100;
+      const movedPct = prevBaseline > 0 ? (Math.abs(mid - prevBaseline) / prevBaseline) * 100 : Number.POSITIVE_INFINITY;
       const moved = this.opts.asPoints ? movedPp : movedPct;
       if (moved >= this.opts.delta) {
-        const arrow = mid > t.baseline ? "🟢" : "🔴";
-        const lines = [
-          `${arrow} #${t.outcome} ${t.label}`,
-          `YES ${t.baseline.toFixed(4)} → ${mid.toFixed(4)}  (${describeMove(t.baseline, mid)})`,
-        ];
-        if (t.expiry) lines.push(`expires ${t.expiry}`);
-        this.notify(lines.join("\n"));
+        const arrow = mid > prevBaseline ? "🟢" : "🔴";
+        this.notify(
+          await this.detailBlock(
+            t,
+            `${arrow} ${t.label}  [#${t.outcome}]\nYES ${prevBaseline.toFixed(4)} → ${mid.toFixed(4)}  (${describeMove(prevBaseline, mid)})`,
+          ),
+        );
         t.baseline = mid;
       }
     }
   }
 
   /** Auto-add listings that appeared after startup: everything in --all mode, pattern matches otherwise. */
-  private addNewListings(mids: Record<string, string>): void {
+  private async addNewListings(mids: Record<string, string>): Promise<void> {
     for (const o of this.meta.outcomes) {
       if (this.tracked.has(o.outcome)) continue;
       if (!this.opts.all && !this.matchesPattern(o)) continue;
       const raw = mids[encodeCoin(o.outcome, YES)];
       if (raw === undefined) continue;
       const t = this.track(o.outcome, Number(raw));
-      this.notify(`🆕 #${t.outcome} listed: ${t.label}\nYES ${t.start.toFixed(4)}${t.expiry ? `\nexpires ${t.expiry}` : ""}`);
+      this.notify(await this.detailBlock(t, `🆕 listed: ${t.label}  [#${t.outcome}]\nYES ${t.start.toFixed(4)}`));
     }
   }
 
@@ -220,8 +278,16 @@ export class Watcher {
       .map((t) => ({ t, drift: Math.abs(t.last - t.start) }))
       .sort((a, b) => b.drift - a.drift)
       .slice(0, 20)
-      .map(({ t }) => `#${t.outcome} ${t.last.toFixed(4)} (session ${describeMove(t.start, t.last)}) ${t.label.slice(0, 50)}`);
-    this.notify(`⏱ hip4 watch — ${this.tracked.size} markets, alert ≥ ${this.thresholdLabel()}\n${rows.join("\n")}`);
+      .map(({ t }) => {
+        const exp = expiryLine(t.expiryMs);
+        return [
+          `• ${t.label}  [#${t.outcome}]`,
+          `  YES ${t.last.toFixed(4)} | session: ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})${exp ? `\n  ${exp}` : ""}`,
+        ].join("\n");
+      });
+    this.notify(
+      `⏱ hip4 watch — ${this.tracked.size} market${this.tracked.size === 1 ? "" : "s"}, alert ≥ ${this.thresholdLabel()}\n\n${rows.join("\n\n")}`,
+    );
   }
 
   async run(explicit: number[], slugs: SlugSpec[] = []): Promise<void> {
@@ -240,10 +306,16 @@ export class Watcher {
     }
     if (this.tracked.size === 0) throw new Error("nothing to watch");
 
-    this.notify(
+    const header =
       `👁 hip4 watch started — ${this.tracked.size} market${this.tracked.size === 1 ? "" : "s"}, ` +
-        `alert on moves ≥ ${this.thresholdLabel()}, polling every ${this.opts.intervalSecs}s`,
+      `alert on moves ≥ ${this.thresholdLabel()}, polling every ${this.opts.intervalSecs}s`;
+    // Full per-market details for small watchlists; headline-only beyond that.
+    const detailed = [...this.tracked.values()].slice(0, 10);
+    const blocks = await Promise.all(
+      detailed.map((t) => this.detailBlock(t, `• ${t.label}  [#${t.outcome}]\nYES ${t.start.toFixed(4)}`)),
     );
+    const overflow = this.tracked.size - detailed.length;
+    this.notify([header, ...blocks, ...(overflow > 0 ? [`…and ${overflow} more`] : [])].join("\n\n"));
 
     const stop = async () => {
       this.notify("🛑 hip4 watch stopped");
@@ -259,8 +331,8 @@ export class Watcher {
       try {
         if (autoAdd && Date.now() - this.lastMetaFetch > META_REFRESH_MS) await this.refreshMeta();
         const m = await this.info.allMids();
-        this.tick(m);
-        if (autoAdd) this.addNewListings(m);
+        await this.tick(m);
+        if (autoAdd) await this.addNewListings(m);
         this.heartbeat();
         process.stdout.write(".");
       } catch (err) {
