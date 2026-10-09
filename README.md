@@ -34,11 +34,36 @@ Two interchangeable signer kinds back every trading command:
   testnet and small experiments. `hip4 wallet new` generates one
   (`--save` writes it straight to `.env` without printing it).
 
+## Funding & accounts
+
+Getting from zero to trading HIP-4:
+
+```sh
+hip4 wallet new --save          # 1. a wallet (or configure Turnkey)
+hip4 deposit 20                 # 2. send native USDC on Arbitrum to Bridge2 (min 5; needs USDC + ETH gas
+                                #    on the SAME address — the bridge credits the sender)
+hip4 move 20 spot               # 3. deposits land in perps; HIP-4 trades spot USDC
+hip4 agent approve              # 4. (recommended) approve an agent/API wallet: it signs orders for the
+                                #    master but can never withdraw; saved to .env, used automatically
+hip4 buy 42 yes -p 0.55 -s 10   # 5. trade — resting GTC limit order by default
+```
+
+Sub-accounts for strategy isolation: `hip4 account create <name>`, `hip4 account list`,
+`hip4 account fund <address> <usdc> [--withdraw]` (perps balance; `move` handles spot).
+
+The agent split mirrors the app's "Enable Trading" signature and pairs well with Turnkey:
+the Turnkey master holds funds behind org policies, while the lightweight agent key signs
+the order flow. Deposits and account-level actions always use the master signer.
+
 ## Commands
 
 ```sh
-npm run hip4 -- whoami                      # signer address + kind + USDC balance
+npm run hip4 -- whoami                      # account + signer kind + spot/perps USDC
 npm run hip4 -- wallet new [--save]         # generate a local wallet
+npm run hip4 -- deposit 20                  # Arbitrum USDC -> Hyperliquid bridge
+npm run hip4 -- move 20 spot                # perps <-> spot USDC
+npm run hip4 -- agent approve               # approve an API wallet for order signing
+npm run hip4 -- account create alpha        # sub-accounts
 npm run hip4 -- markets                     # list live outcome markets with YES mids
 npm run hip4 -- markets --all               # include near-resolved markets
 npm run hip4 -- book 42                     # YES/NO books for outcome 42 (index or trade URL)

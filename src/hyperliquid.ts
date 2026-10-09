@@ -145,6 +145,14 @@ export interface SpotBalance {
   entryNtl?: string;
 }
 
+export interface SubAccount {
+  name: string;
+  subAccountUser: string;
+  master: string;
+  clearinghouseState?: { marginSummary?: { accountValue?: string } };
+  spotState?: { balances?: SpotBalance[] };
+}
+
 export interface OpenOrder {
   coin: string;
   oid: number;
@@ -195,5 +203,19 @@ export class HyperliquidInfo {
 
   async openOrders(user: string): Promise<OpenOrder[]> {
     return this.info<OpenOrder[]>({ type: "frontendOpenOrders", user });
+  }
+
+  /** Perps account value in USDC (deposits land here before `move`ing to spot). */
+  async perpAccountValue(user: string): Promise<string> {
+    const res = await this.info<{ marginSummary?: { accountValue?: string } }>({
+      type: "clearinghouseState",
+      user,
+    });
+    return res.marginSummary?.accountValue ?? "0";
+  }
+
+  async subAccounts(user: string): Promise<SubAccount[]> {
+    const res = await this.info<SubAccount[] | null>({ type: "subAccounts", user });
+    return res ?? [];
   }
 }

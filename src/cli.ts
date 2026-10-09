@@ -23,16 +23,43 @@ import {
 const cfg = loadConfig();
 const info = new HyperliquidInfo(cfg.hlApiUrl);
 
-async function exchangeClient(): Promise<{ exchange: ExchangeClient; address: string; kind: string }> {
-  const { account, kind } = await resolveSigner(cfg);
+/**
+ * Exchange client for trading actions. Prefers the approved agent key (signs
+ * orders, applies to the master account, cannot withdraw); falls back to the
+ * master signer itself. `master: true` forces the master signer — required for
+ * account-level actions (approveAgent, deposits, transfers, sub-accounts).
+ */
+async function exchangeClient(opts: { master?: boolean } = {}): Promise<{ exchange: ExchangeClient; address: string; kind: string }> {
   const transport = new HttpTransport({ isTestnet: cfg.testnet });
+  if (!opts.master && cfg.agentPrivateKey) {
+    const { privateKeyToAccount } = await import("viem/accounts");
+    const agent = privateKeyToAccount(cfg.agentPrivateKey);
+    const address = cfg.masterAddress ?? agent.address;
+    return { exchange: new ExchangeClient({ transport, wallet: agent }), address, kind: "agent" };
+  }
+  const { account, kind } = await resolveSigner(cfg);
   return { exchange: new ExchangeClient({ transport, wallet: account }), address: account.address, kind };
 }
 
-/** Signer address without constructing the exchange client (info-only commands). */
+/** The account whose state info commands read: master when configured, else the signer. */
 async function signerAddress(): Promise<string> {
+  if (cfg.masterAddress) return cfg.masterAddress;
   const { account } = await resolveSigner(cfg);
   return account.address;
+}
+
+/** Append env vars to .env, refusing to overwrite existing non-empty values. */
+async function saveEnv(pairs: Record<string, string>): Promise<void> {
+  const { readFile, writeFile } = await import("node:fs/promises");
+  const envPath = new URL("../.env", import.meta.url).pathname;
+  const existing = await readFile(envPath, "utf8").catch(() => "");
+  for (const key of Object.keys(pairs)) {
+    if (new RegExp(`^\\s*${key}\\s*=\\s*\\S`, "m").test(existing)) {
+      throw new Error(`.env already has ${key} — refusing to overwrite it`);
+    }
+  }
+  const lines = Object.entries(pairs).map(([k, v]) => `${k}=${v}`).join("\n");
+  await writeFile(envPath, `${existing}${existing.endsWith("\n") || existing === "" ? "" : "\n"}${lines}\n`);
 }
 
 function validatePx(px: number): string {
@@ -104,11 +131,13 @@ program
   .command("whoami")
   .description("Show the signing address and its USDC spot balance")
   .action(async () => {
-    const { account, kind } = await resolveSigner(cfg);
-    console.log(`address: ${account.address} (${kind})${cfg.testnet ? " [testnet]" : ""}`);
-    const balances = await info.spotBalances(account.address);
+    const address = await signerAddress();
+    const signerKind = cfg.agentPrivateKey ? "agent key for orders" : (await resolveSigner(cfg)).kind;
+    console.log(`account: ${address} (${signerKind})${cfg.testnet ? " [testnet]" : ""}`);
+    const [balances, perpValue] = await Promise.all([info.spotBalances(address), info.perpAccountValue(address)]);
     const usdc = balances.find((b) => b.coin === "USDC");
-    console.log(`USDC: total=${usdc?.total ?? "0"} hold=${usdc?.hold ?? "0"}`);
+    console.log(`spot USDC:  total=${usdc?.total ?? "0"} hold=${usdc?.hold ?? "0"}  (HIP-4 trades from here)`);
+    console.log(`perps USDC: ${perpValue}  (deposits land here; \`hip4 move <amt> spot\` to trade HIP-4)`);
   });
 
 program
@@ -125,14 +154,101 @@ program
       console.log("store it safely; pass --save to write it to .env instead of printing");
       return;
     }
-    const { readFile, writeFile } = await import("node:fs/promises");
-    const envPath = new URL("../.env", import.meta.url).pathname;
-    const existing = await readFile(envPath, "utf8").catch(() => "");
-    if (/^\s*WALLET_PRIVATE_KEY\s*=\s*0x/m.test(existing)) {
-      throw new Error(".env already has a WALLET_PRIVATE_KEY — refusing to overwrite it");
-    }
-    await writeFile(envPath, `${existing}${existing.endsWith("\n") || existing === "" ? "" : "\n"}WALLET_PRIVATE_KEY=${privateKey}\n`);
+    await saveEnv({ WALLET_PRIVATE_KEY: privateKey });
     console.log("private key: saved to .env as WALLET_PRIVATE_KEY (not printed)");
+  });
+
+program
+  .command("deposit")
+  .description("Deposit USDC to Hyperliquid: sends native USDC on Arbitrum to the Bridge2 contract (min 5)")
+  .argument("<usdc>", "amount of USDC", Number)
+  .action(async (usdc: number) => {
+    const { depositToBridge, MIN_DEPOSIT_USDC } = await import("./funds.js");
+    void MIN_DEPOSIT_USDC;
+    // The bridge credits the sender, so this must be the master signer, never the agent.
+    const { account, kind } = await resolveSigner(cfg);
+    console.log(`depositing ${usdc} USDC from ${account.address} (${kind})${cfg.testnet ? " [testnet]" : ""}`);
+    const { hash } = await depositToBridge(cfg, account, usdc);
+    console.log(`bridge transfer sent: ${hash}`);
+    console.log("credited to the sending address on Hyperliquid in <1 min; lands in the PERPS balance —");
+    console.log(`run \`hip4 move ${usdc} spot\` to make it tradable on HIP-4 markets`);
+  });
+
+program
+  .command("move")
+  .description("Move USDC between your perps and spot balances (HIP-4 trades spot USDC)")
+  .argument("<usdc>", "amount of USDC", Number)
+  .argument("<to>", "spot | perp")
+  .action(async (usdc: number, to: string) => {
+    if (!(usdc > 0)) throw new Error(`amount must be > 0, got ${usdc}`);
+    if (to !== "spot" && to !== "perp") throw new Error(`destination must be "spot" or "perp", got "${to}"`);
+    const { exchange, address, kind } = await exchangeClient({ master: true });
+    console.log(`moving ${usdc} USDC to ${to} for ${address} (${kind})`);
+    await exchange.usdClassTransfer({ amount: String(usdc), toPerp: to === "perp" });
+    console.log("done");
+  });
+
+const agent = program.command("agent").description("Agent (API) wallets: sign orders for the master account, cannot withdraw");
+agent
+  .command("approve")
+  .description("Generate an agent wallet, approve it with the master signer, and save it to .env")
+  .option("--name <name>", "agent name (1-16 chars)", "hip4")
+  .action(async (opts: { name: string }) => {
+    const { exchange, address, kind } = await exchangeClient({ master: true });
+    const { privateKey, address: agentAddress } = newLocalWallet();
+    console.log(`approving agent ${agentAddress} ("${opts.name}") for master ${address} (${kind})`);
+    await exchange.approveAgent({ agentAddress: agentAddress as `0x${string}`, agentName: opts.name });
+    await saveEnv({ AGENT_PRIVATE_KEY: privateKey, MASTER_ADDRESS: address });
+    console.log("approved — AGENT_PRIVATE_KEY and MASTER_ADDRESS saved to .env (key not printed)");
+    console.log("orders now sign with the agent key; funds and withdrawals stay with the master");
+  });
+
+const account = program.command("account").description("Sub-accounts under the master account");
+account
+  .command("create")
+  .description("Create a named sub-account")
+  .argument("<name>", "sub-account name")
+  .action(async (name: string) => {
+    const { exchange, address, kind } = await exchangeClient({ master: true });
+    console.log(`creating sub-account "${name}" under ${address} (${kind})`);
+    const res = await exchange.createSubAccount({ name });
+    console.log(JSON.stringify(res.response, null, 2));
+  });
+account
+  .command("list")
+  .description("List sub-accounts with balances")
+  .action(async () => {
+    const address = await signerAddress();
+    const subs = await info.subAccounts(address);
+    if (subs.length === 0) {
+      console.log("no sub-accounts");
+      return;
+    }
+    console.table(
+      subs.map((s) => ({
+        name: s.name,
+        address: s.subAccountUser,
+        perpUsd: s.clearinghouseState?.marginSummary?.accountValue ?? "?",
+        spotUsdc: s.spotState?.balances?.find((b) => b.coin === "USDC")?.total ?? "0",
+      })),
+    );
+  });
+account
+  .command("fund")
+  .description("Transfer perps USDC into (or out of, with --withdraw) a sub-account")
+  .argument("<address>", "sub-account address (from `hip4 account list`)")
+  .argument("<usdc>", "amount of USDC", Number)
+  .option("--withdraw", "pull funds from the sub-account back to the master")
+  .action(async (subAddress: string, usdc: number, opts: { withdraw?: boolean }) => {
+    if (!(usdc > 0)) throw new Error(`amount must be > 0, got ${usdc}`);
+    const { exchange, address, kind } = await exchangeClient({ master: true });
+    console.log(`${opts.withdraw ? "withdrawing" : "depositing"} ${usdc} USDC ${opts.withdraw ? "from" : "to"} ${subAddress} (master ${address}, ${kind})`);
+    await exchange.subAccountTransfer({
+      subAccountUser: subAddress as `0x${string}`,
+      isDeposit: !opts.withdraw,
+      usd: Math.round(usdc * 1e6),
+    });
+    console.log("done — note this moves PERPS balance; use `hip4 move` (with the sub-account suffix) for spot");
   });
 
 program

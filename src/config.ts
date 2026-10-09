@@ -5,7 +5,13 @@ export interface Config {
   hlApiUrl: string;
   /** HyperEVM JSON-RPC endpoint, for direct HyperCore reads via precompiles. */
   evmRpcUrl: string;
+  /** Arbitrum JSON-RPC for bridge deposits; null = chain default. */
+  arbRpcUrl: string | null;
   testnet: boolean;
+  /** Approved agent (API wallet) key: signs orders, cannot withdraw. */
+  agentPrivateKey: `0x${string}` | null;
+  /** The master account the agent trades for; info queries use this address. */
+  masterAddress: `0x${string}` | null;
   turnkey: {
     apiBaseUrl: string;
     apiPublicKey: string;
@@ -61,7 +67,14 @@ export function loadConfig(): Config {
     evmRpcUrl:
       process.env.HL_EVM_RPC_URL ??
       (testnet ? "https://rpc.hyperliquid-testnet.xyz/evm" : "https://rpc.hyperliquid.xyz/evm"),
+    arbRpcUrl: process.env.ARBITRUM_RPC_URL ?? null,
     testnet,
+    agentPrivateKey: process.env.AGENT_PRIVATE_KEY?.startsWith("0x")
+      ? (process.env.AGENT_PRIVATE_KEY as `0x${string}`)
+      : null,
+    masterAddress: process.env.MASTER_ADDRESS?.startsWith("0x")
+      ? (process.env.MASTER_ADDRESS as `0x${string}`)
+      : null,
     turnkey: turnkeyConfigured ? tk : null,
     signerMode: signerEnv ?? "auto",
     localWallet: {
