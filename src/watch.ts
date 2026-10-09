@@ -6,6 +6,8 @@ import {
   describeOutcome,
   encodeCoin,
   outcomeExpiryMs,
+  parseDescription,
+  type HlOutcome,
   type OutcomeMeta,
 } from "./hyperliquid.js";
 
@@ -16,11 +18,57 @@ export interface WatchOptions {
   asPoints: boolean;
   /** Watch the whole live universe and auto-add new listings. */
   all: boolean;
+  /** Case-insensitive substrings matched against market labels; new matching listings auto-add. */
+  patterns: string[];
   /** Watch the outcomes this address holds tokens in. */
   user: string | null;
   /** Periodic digest to the channel; 0 disables. */
   heartbeatMins: number;
   telegram: { token: string; chatId: string } | null;
+}
+
+const MONTHS: Record<string, string> = {
+  jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+  jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+};
+
+export interface SlugSpec {
+  raw: string;
+  underlying: string;
+  thresholdDigits: string;
+  mmdd: string;
+  hhmm: string;
+}
+
+/** Parse an app.hyperliquid.xyz trade URL or slug like "btc-above-82334-yes-oct-10-0600"; null if not slug-shaped. */
+export function parseMarketSlug(input: string): SlugSpec | null {
+  const slug = input.replace(/[/?#]+$/, "").split("/").pop()!.split("?")[0]!.toLowerCase();
+  const m = slug.match(/^([a-z0-9]+)-above-(\d+)-(?:yes|no)-([a-z]{3})-(\d{2})-(\d{4})$/);
+  const mon = m ? MONTHS[m[3]!] : undefined;
+  if (!m || !mon) return null;
+  return { raw: input, underlying: m[1]!.toUpperCase(), thresholdDigits: m[2]!, mmdd: mon + m[4]!, hhmm: m[5]! };
+}
+
+const digits = (s: string) => s.replace(/\D/g, "");
+
+/** Find the live outcome index a slug refers to, or null. */
+export function resolveSlug(meta: OutcomeMeta, spec: SlugSpec): number | null {
+  for (const o of meta.outcomes) {
+    const d = parseDescription(o.description);
+    // Daily price binaries come in two shapes: template:binaryPrice[External]
+    // (perp/threshold/time) and class:priceBinary (underlying/targetPrice/expiry).
+    const isTemplate = o.name === "template:binaryPrice" || o.name === "template:binaryPriceExternal";
+    const isClass = d.class === "priceBinary";
+    if (!isTemplate && !isClass) continue;
+    const underlying = isTemplate ? d.perp : d.underlying;
+    const threshold = isTemplate ? d.threshold : d.targetPrice;
+    const time = isTemplate ? d.time : d.expiry;
+    if ((underlying ?? "").toUpperCase() !== spec.underlying) continue;
+    if (digits(threshold ?? "") !== spec.thresholdDigits) continue;
+    if (!(time ?? "").endsWith(`${spec.mmdd}-${spec.hhmm}`)) continue;
+    return o.outcome;
+  }
+  return null;
 }
 
 interface Tracked {
@@ -70,25 +118,41 @@ export class Watcher {
     return this.opts.asPoints ? `${this.opts.delta}pp` : `${this.opts.delta}%`;
   }
 
-  /** Resolve which outcome indices to watch. */
-  private async resolveWatchSet(explicit: number[]): Promise<number[]> {
-    if (explicit.length > 0) return explicit;
+  private matchesPattern(o: HlOutcome): boolean {
+    if (this.opts.patterns.length === 0) return false;
+    const hay = `${describeOutcome(o, this.meta.questions)} ${o.name} ${o.description}`.toLowerCase();
+    return this.opts.patterns.some((p) => hay.includes(p));
+  }
+
+  /** Resolve which outcome indices to watch; sources combine. */
+  private async resolveWatchSet(explicit: number[], slugs: SlugSpec[]): Promise<number[]> {
+    const set = new Set<number>(explicit);
+    for (const s of slugs) {
+      const outcome = resolveSlug(this.meta, s);
+      if (outcome === null) console.warn(`no live outcome matches "${s.raw}" (expired or not yet listed?)`);
+      else set.add(outcome);
+    }
+    for (const o of this.meta.outcomes) {
+      if (this.matchesPattern(o)) set.add(o.outcome);
+    }
     if (this.opts.user) {
       const balances = await this.info.spotBalances(this.opts.user);
-      const outcomes = new Set<number>();
       for (const b of balances) {
-        if (b.coin.startsWith("+") && Number(b.total) > 0) outcomes.add(decodeCoin(b.coin).outcome);
+        if (b.coin.startsWith("+") && Number(b.total) > 0) set.add(decodeCoin(b.coin).outcome);
       }
-      if (outcomes.size === 0) throw new Error(`${this.opts.user} holds no outcome tokens — nothing to watch`);
-      return [...outcomes];
     }
     if (this.opts.all) {
       const mids = await this.info.allMids();
-      return this.meta.outcomes
-        .filter((o) => mids[encodeCoin(o.outcome, YES)] !== undefined)
-        .map((o) => o.outcome);
+      for (const o of this.meta.outcomes) {
+        if (mids[encodeCoin(o.outcome, YES)] !== undefined) set.add(o.outcome);
+      }
     }
-    throw new Error("give outcome indices, or use --all / --user <address> / --positions");
+    if (set.size === 0) {
+      throw new Error(
+        "nothing to watch — give outcome indices / trade URLs / name patterns, set WATCH_WHITELIST, or use --all / --positions / --user",
+      );
+    }
+    return [...set];
   }
 
   private track(outcome: number, mid: number): Tracked {
@@ -136,10 +200,11 @@ export class Watcher {
     }
   }
 
-  /** Auto-add listings that appeared after startup (only in --all mode). */
+  /** Auto-add listings that appeared after startup: everything in --all mode, pattern matches otherwise. */
   private addNewListings(mids: Record<string, string>): void {
     for (const o of this.meta.outcomes) {
       if (this.tracked.has(o.outcome)) continue;
+      if (!this.opts.all && !this.matchesPattern(o)) continue;
       const raw = mids[encodeCoin(o.outcome, YES)];
       if (raw === undefined) continue;
       const t = this.track(o.outcome, Number(raw));
@@ -159,9 +224,9 @@ export class Watcher {
     this.notify(`⏱ hip4 watch — ${this.tracked.size} markets, alert ≥ ${this.thresholdLabel()}\n${rows.join("\n")}`);
   }
 
-  async run(explicit: number[]): Promise<void> {
+  async run(explicit: number[], slugs: SlugSpec[] = []): Promise<void> {
     await this.refreshMeta();
-    const outcomes = await this.resolveWatchSet(explicit);
+    const outcomes = await this.resolveWatchSet(explicit, slugs);
     const mids = await this.info.allMids();
 
     for (const outcome of outcomes) {
@@ -190,11 +255,12 @@ export class Watcher {
 
     for (;;) {
       await new Promise((r) => setTimeout(r, this.opts.intervalSecs * 1000));
+      const autoAdd = this.opts.all || this.opts.patterns.length > 0;
       try {
-        if (this.opts.all && Date.now() - this.lastMetaFetch > META_REFRESH_MS) await this.refreshMeta();
+        if (autoAdd && Date.now() - this.lastMetaFetch > META_REFRESH_MS) await this.refreshMeta();
         const m = await this.info.allMids();
         this.tick(m);
-        if (this.opts.all) this.addNewListings(m);
+        if (autoAdd) this.addNewListings(m);
         this.heartbeat();
         process.stdout.write(".");
       } catch (err) {

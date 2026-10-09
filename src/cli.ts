@@ -3,7 +3,7 @@ import { Command } from "commander";
 import { ExchangeClient, HttpTransport } from "@nktkas/hyperliquid";
 import { loadConfig } from "./config.js";
 import { loadAccount } from "./wallet.js";
-import { Watcher } from "./watch.js";
+import { Watcher, parseMarketSlug, type SlugSpec } from "./watch.js";
 import {
   HyperliquidInfo,
   NO,
@@ -252,10 +252,30 @@ program
     console.table(rows);
   });
 
+/** Classify watchlist entries: outcome index, trade URL/slug, or name pattern. */
+function classifyWatchEntries(entries: string[]): { indices: number[]; slugs: SlugSpec[]; patterns: string[] } {
+  const indices: number[] = [];
+  const slugs: SlugSpec[] = [];
+  const patterns: string[] = [];
+  for (const e of entries) {
+    if (/^\d+$/.test(e)) {
+      indices.push(Number.parseInt(e, 10));
+      continue;
+    }
+    const slug = parseMarketSlug(e);
+    if (slug) slugs.push(slug);
+    else patterns.push(e.toLowerCase());
+  }
+  return { indices, slugs, patterns };
+}
+
 program
   .command("watch")
   .description("Track YES mids and send a Telegram channel alert when a market moves past a threshold")
-  .argument("[outcomes...]", "outcome indices to watch (from `hip4 markets`)")
+  .argument(
+    "[markets...]",
+    "whitelist: outcome indices, app.hyperliquid.xyz trade URLs, or name patterns (falls back to WATCH_WHITELIST env)",
+  )
   .option("-d, --delta <pct>", "alert threshold: relative % move of the YES mid since the last alert", "5")
   .option("--pp", "interpret --delta as probability percentage points instead of relative %")
   .option("-i, --interval <secs>", "poll interval in seconds", "30")
@@ -265,24 +285,30 @@ program
   .option("--heartbeat <mins>", "periodic digest of watched markets to the channel; 0 disables", "60")
   .action(
     async (
-      outcomes: string[],
+      markets: string[],
       opts: { delta: string; pp?: boolean; interval: string; all?: boolean; positions?: boolean; user?: string; heartbeat: string },
     ) => {
       const delta = Number(opts.delta);
       const intervalSecs = Number(opts.interval);
       if (!(delta > 0)) throw new Error(`--delta must be > 0, got "${opts.delta}"`);
       if (!(intervalSecs >= 2)) throw new Error(`--interval must be >= 2 seconds, got "${opts.interval}"`);
+      const entries = markets.length > 0 ? markets : cfg.watchWhitelist;
+      if (markets.length === 0 && entries.length > 0) {
+        console.log(`using WATCH_WHITELIST: ${entries.join(", ")}`);
+      }
+      const { indices, slugs, patterns } = classifyWatchEntries(entries);
       const user = opts.user ?? (opts.positions ? await signerAddress() : null);
       const watcher = new Watcher(info, {
         intervalSecs,
         delta,
         asPoints: Boolean(opts.pp),
         all: Boolean(opts.all),
+        patterns,
         user,
         heartbeatMins: Number(opts.heartbeat),
         telegram: cfg.telegram,
       });
-      await watcher.run(outcomes.map((o) => Number.parseInt(o, 10)));
+      await watcher.run(indices, slugs);
     },
   );
 

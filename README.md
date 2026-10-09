@@ -39,12 +39,21 @@ npm run hip4 -- positions                   # held outcome tokens
 ### Watch + Telegram alerts
 
 ```sh
+npm run hip4 -- watch                       # watch the WATCH_WHITELIST from .env
 npm run hip4 -- watch 10095 10097           # watch specific outcomes
+npm run hip4 -- watch https://app.hyperliquid.xyz/trade/btc-above-82334-yes-oct-10-0600
+npm run hip4 -- watch "BTC >="              # name pattern; auto-adds new matching listings
 npm run hip4 -- watch --positions           # watch markets the signing wallet holds
 npm run hip4 -- watch --user 0xabc…         # watch markets an address holds
 npm run hip4 -- watch --all -d 10           # whole universe, alert on ≥10% moves
 npm run hip4 -- watch 10095 -d 3 --pp -i 10 # ≥3 probability points, poll every 10s
 ```
+
+Whitelist entries (CLI args, or `WATCH_WHITELIST` comma-separated in `.env` when run bare)
+can be outcome indices, `app.hyperliquid.xyz/trade/...` URLs, or case-insensitive name
+patterns. Pattern entries re-match every 10 minutes, so recurring markets (hourly BTC
+binaries, weekly sports) keep getting picked up as they list; URL/index entries pin one
+specific market.
 
 `watch` polls YES mids and posts to the Telegram channel whenever a market moves at
 least `--delta` since the **last alert** (the baseline resets each time it fires, so a

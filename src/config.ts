@@ -16,6 +16,8 @@ export interface Config {
   rawPrivateKey: `0x${string}` | null;
   /** Telegram channel notifications (optional; `watch` degrades to console-only). */
   telegram: { token: string; chatId: string } | null;
+  /** Default watchlist for `watch`: outcome indices and/or name patterns. */
+  watchWhitelist: string[];
 }
 
 export function loadConfig(): Config {
@@ -45,5 +47,9 @@ export function loadConfig(): Config {
     turnkey: turnkeyConfigured ? tk : null,
     rawPrivateKey: rawKey && rawKey.startsWith("0x") ? (rawKey as `0x${string}`) : null,
     telegram: tgToken !== "" && tgChatId !== "" ? { token: tgToken, chatId: tgChatId } : null,
+    watchWhitelist: (process.env.WATCH_WHITELIST ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s !== ""),
   };
 }
