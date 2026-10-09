@@ -41,7 +41,10 @@ npm run hip4 -- whoami                      # signer address + kind + USDC balan
 npm run hip4 -- wallet new [--save]         # generate a local wallet
 npm run hip4 -- markets                     # list live outcome markets with YES mids
 npm run hip4 -- markets --all               # include near-resolved markets
-npm run hip4 -- book 42                     # YES/NO books for outcome 42
+npm run hip4 -- book 42                     # YES/NO books for outcome 42 (index or trade URL)
+npm run hip4 -- book 42 --rpc               # best bid/offer direct from HyperCore via HyperEVM precompile
+npm run hip4 -- book 42 -f -i 3             # follow: log top-of-book changes every 3s
+npm run hip4 -- book 42 -f --jsonl book.jsonl   # also append full snapshots as JSON lines
 npm run hip4 -- buy 42 yes -p 0.55 -s 100   # buy 100 YES @ 0.55 (GTC)
 npm run hip4 -- buy 42 no -p 0.50 -s 50 -t Ioc
 npm run hip4 -- sell 42 yes -p 0.70 -s 100
@@ -90,6 +93,16 @@ env vars it still runs, logging alerts to the console.
 
 Prices are probabilities in `(0, 1)`; sizes are contracts (each pays 1 USDC if it settles in
 your favor).
+
+### Order-book reads: API vs --rpc
+
+Default `book` reads full L2 depth from the info API (HyperCore via REST). With `--rpc`
+it instead calls the HyperEVM `bbo` read-precompile (`0x…080e`) with the outcome's asset
+id — HyperCore state read directly on-chain, no REST on the hot path. Precompiles expose
+top-of-book prices only (no sizes, no depth), and the outcome-token price scale is
+undocumented, so the divisor is calibrated once against a single REST read. Set
+`HL_EVM_RPC_URL` to use your own node; defaults to the public
+`rpc.hyperliquid.xyz/evm`.
 
 ## HIP-4 encoding notes
 

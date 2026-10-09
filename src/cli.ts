@@ -3,7 +3,8 @@ import { Command } from "commander";
 import { ExchangeClient, HttpTransport } from "@nktkas/hyperliquid";
 import { loadConfig } from "./config.js";
 import { newLocalWallet, resolveSigner } from "./wallet.js";
-import { Watcher, parseMarketSlug, type SlugSpec } from "./watch.js";
+import { Watcher, parseMarketSlug, resolveSlug, type SlugSpec } from "./watch.js";
+import { HyperliquidRpc, OutcomeBboReader } from "./rpc.js";
 import {
   HyperliquidInfo,
   NO,
@@ -158,23 +159,92 @@ program
     console.log(`${rows.length} shown / ${meta.outcomes.length} outcomes, ${meta.questions.length} questions`);
   });
 
+/** Resolve a market argument — outcome index or app.hyperliquid.xyz trade URL/slug. */
+async function resolveMarket(market: string): Promise<{ outcome: number; label: string }> {
+  const meta = await info.outcomeMeta();
+  if (/^\d+$/.test(market)) {
+    const outcome = Number.parseInt(market, 10);
+    return { outcome, label: await labelFor(meta, outcome) };
+  }
+  const slug = parseMarketSlug(market);
+  if (!slug) throw new Error(`"${market}" is neither an outcome index nor a trade URL/slug`);
+  const outcome = resolveSlug(meta, slug);
+  if (outcome === null) throw new Error(`no live outcome matches "${market}" (expired or not yet listed?)`);
+  return { outcome, label: await labelFor(meta, outcome) };
+}
+
 program
   .command("book")
-  .description("Show YES and NO order books for an outcome")
-  .argument("<outcome>", "outcome index (from `hip4 markets`)", (v) => Number.parseInt(v, 10))
-  .option("-d, --depth <n>", "levels per side", "5")
-  .action(async (outcome: number, opts: { depth: string }) => {
+  .description("Read YES/NO order books — via the info API, or directly from HyperCore with --rpc")
+  .argument("<market>", "outcome index (from `hip4 markets`) or app.hyperliquid.xyz trade URL")
+  .option("-d, --depth <n>", "levels per side (API mode)", "5")
+  .option("-f, --follow", "keep polling and log top-of-book changes")
+  .option("-i, --interval <secs>", "poll interval with --follow", "5")
+  .option("--rpc", "read best bid/offer from the HyperEVM bbo precompile (HyperCore state, prices only)")
+  .option("--jsonl <file>", "append each snapshot as a JSON line to this file")
+  .action(async (market: string, opts: { depth: string; follow?: boolean; interval: string; rpc?: boolean; jsonl?: string }) => {
     const depth = Number(opts.depth);
-    const meta = await info.outcomeMeta();
-    console.log(await labelFor(meta, outcome));
-    const sides: Side[] = [YES, NO];
-    for (const side of sides) {
-      const coin = encodeCoin(outcome, side);
-      const book = await info.l2Book(coin);
-      console.log(`\n${sideName(side)} (${coin})`);
-      const fmt = (l: { px: number; sz: number }) => `${l.px.toFixed(4)} x ${l.sz}`;
-      console.log(`  asks: ${book.asks.slice(0, depth).map(fmt).join("  ") || "(empty)"}`);
-      console.log(`  bids: ${book.bids.slice(0, depth).map(fmt).join("  ") || "(empty)"}`);
+    const intervalMs = Math.max(1, Number(opts.interval)) * 1000;
+    const { outcome, label } = await resolveMarket(market);
+    console.log(`${label}  [#${outcome}]${opts.rpc ? `  (rpc: ${cfg.evmRpcUrl})` : ""}`);
+
+    const bboReader = opts.rpc ? new OutcomeBboReader(new HyperliquidRpc(cfg.evmRpcUrl), info, outcome) : null;
+    const jsonl = opts.jsonl
+      ? await import("node:fs").then((fs) => fs.createWriteStream(opts.jsonl!, { flags: "a" }))
+      : null;
+    const logSnapshot = (snap: unknown) => jsonl?.write(`${JSON.stringify(snap)}\n`);
+    const fmtPx = (v: number | null | undefined) => (v !== null && v !== undefined ? v.toFixed(4) : "—");
+
+    /** One read; returns a change-detection key and prints/logs. */
+    const readOnce = async (prevKey: string | null): Promise<string> => {
+      const ts = new Date().toISOString();
+      if (bboReader) {
+        const bbo = await bboReader.read();
+        if (!bbo) {
+          console.log(`${ts.slice(11, 19)} calibrating price scale (book one-sided?) — retrying`);
+          return prevKey ?? "";
+        }
+        const line =
+          `YES ${fmtPx(bbo.yes.bid)}/${fmtPx(bbo.yes.ask)} | NO ${fmtPx(bbo.no.bid)}/${fmtPx(bbo.no.ask)}`;
+        if (line !== prevKey) console.log(`${ts.slice(11, 19)} [rpc] ${line}`);
+        logSnapshot({ ts, outcome, src: "rpc", ...bbo });
+        return line;
+      }
+      const [yes, no] = await Promise.all([
+        info.l2Book(encodeCoin(outcome, YES)),
+        info.l2Book(encodeCoin(outcome, NO)),
+      ]);
+      logSnapshot({ ts, outcome, src: "api", yes, no });
+      if (!opts.follow) {
+        const sides: [Side, typeof yes][] = [
+          [YES, yes],
+          [NO, no],
+        ];
+        for (const [side, book] of sides) {
+          console.log(`\n${sideName(side)} (${encodeCoin(outcome, side)})`);
+          const fmt = (l: { px: number; sz: number }) => `${l.px.toFixed(4)} x ${l.sz}`;
+          console.log(`  asks: ${book.asks.slice(0, depth).map(fmt).join("  ") || "(empty)"}`);
+          console.log(`  bids: ${book.bids.slice(0, depth).map(fmt).join("  ") || "(empty)"}`);
+        }
+        return "";
+      }
+      const tob = (b: typeof yes) =>
+        `${fmtPx(b.bids[0]?.px)} x ${b.bids[0]?.sz ?? 0} / ${fmtPx(b.asks[0]?.px)} x ${b.asks[0]?.sz ?? 0}`;
+      const line = `YES ${tob(yes)} | NO ${tob(no)}`;
+      if (line !== prevKey) console.log(`${ts.slice(11, 19)} ${line}`);
+      return line;
+    };
+
+    let key = await readOnce(null);
+    if (!opts.follow && !bboReader) return;
+    if (!opts.follow) return;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      try {
+        key = await readOnce(key);
+      } catch (err) {
+        console.warn(`read failed, retrying: ${String(err).slice(0, 150)}`);
+      }
     }
   });
 

@@ -3,6 +3,8 @@ import "dotenv/config";
 export interface Config {
   /** Hyperliquid REST API base (no trailing slash). */
   hlApiUrl: string;
+  /** HyperEVM JSON-RPC endpoint, for direct HyperCore reads via precompiles. */
+  evmRpcUrl: string;
   testnet: boolean;
   turnkey: {
     apiBaseUrl: string;
@@ -56,6 +58,9 @@ export function loadConfig(): Config {
 
   return {
     hlApiUrl,
+    evmRpcUrl:
+      process.env.HL_EVM_RPC_URL ??
+      (testnet ? "https://rpc.hyperliquid-testnet.xyz/evm" : "https://rpc.hyperliquid.xyz/evm"),
     testnet,
     turnkey: turnkeyConfigured ? tk : null,
     signerMode: signerEnv ?? "auto",
