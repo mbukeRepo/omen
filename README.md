@@ -18,13 +18,27 @@ cp .env.example .env   # fill in Turnkey credentials
 | `TURNKEY_ORGANIZATION_ID` | Org (or sub-org) that owns the wallet |
 | `TURNKEY_SIGN_WITH` | Wallet account address (`0x…`) or private key id to sign with |
 | `HL_TESTNET` | `true` to target Hyperliquid testnet |
-| `HL_PRIVATE_KEY` | Dev-only fallback signer when Turnkey vars are unset |
+| `SIGNER` | `turnkey` or `local`; unset = auto (Turnkey when configured, else local) |
+| `WALLET_PRIVATE_KEY` | Local viem signer (alias: `HL_PRIVATE_KEY`) |
+| `WALLET_MNEMONIC` / `WALLET_ACCOUNT_INDEX` | Local HD wallet alternative to a raw key |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Channel alerts for `watch` (bot must be a channel admin; chat id is `@name` or `-100…`) |
+
+## Signers
+
+Two interchangeable signer kinds back every trading command:
+
+- **Turnkey** (default when configured): a viem account backed by Turnkey — every
+  signature is a policy-controlled Turnkey activity, no key on this machine.
+- **Local** (`SIGNER=local`, or auto when Turnkey is unset): a plain viem local account
+  from `WALLET_PRIVATE_KEY` or an HD `WALLET_MNEMONIC`. Hot-wallet grade — handy for
+  testnet and small experiments. `hip4 wallet new` generates one
+  (`--save` writes it straight to `.env` without printing it).
 
 ## Commands
 
 ```sh
-npm run hip4 -- whoami                      # signer address + USDC balance
+npm run hip4 -- whoami                      # signer address + kind + USDC balance
+npm run hip4 -- wallet new [--save]         # generate a local wallet
 npm run hip4 -- markets                     # list live outcome markets with YES mids
 npm run hip4 -- markets --all               # include near-resolved markets
 npm run hip4 -- book 42                     # YES/NO books for outcome 42

@@ -12,8 +12,14 @@ export interface Config {
     /** Wallet account address (0x…) or Turnkey private key id to sign with. */
     signWith: string;
   } | null;
-  /** Dev-only fallback signer; used when Turnkey is not configured. */
-  rawPrivateKey: `0x${string}` | null;
+  /** Which signer to use; "auto" prefers Turnkey when configured, else local. */
+  signerMode: "auto" | "turnkey" | "local";
+  /** Local viem wallet: raw private key, or mnemonic + HD account index. */
+  localWallet: {
+    privateKey: `0x${string}` | null;
+    mnemonic: string | null;
+    accountIndex: number;
+  };
   /** Telegram channel notifications (optional; `watch` degrades to console-only). */
   telegram: { token: string; chatId: string } | null;
   /** Default watchlist for `watch`: outcome indices and/or name patterns. */
@@ -36,7 +42,14 @@ export function loadConfig(): Config {
   const turnkeyConfigured =
     tk.apiPublicKey !== "" && tk.apiPrivateKey !== "" && tk.organizationId !== "" && tk.signWith !== "";
 
-  const rawKey = process.env.HL_PRIVATE_KEY;
+  // WALLET_PRIVATE_KEY is the canonical name; HL_PRIVATE_KEY kept for back-compat.
+  const rawKey = process.env.WALLET_PRIVATE_KEY ?? process.env.HL_PRIVATE_KEY;
+  const mnemonic = process.env.WALLET_MNEMONIC?.trim();
+
+  const signerEnv = process.env.SIGNER;
+  if (signerEnv !== undefined && signerEnv !== "turnkey" && signerEnv !== "local") {
+    throw new Error(`SIGNER must be "turnkey" or "local", got "${signerEnv}"`);
+  }
 
   const tgToken = process.env.TELEGRAM_BOT_TOKEN ?? "";
   const tgChatId = process.env.TELEGRAM_CHAT_ID ?? "";
@@ -45,7 +58,12 @@ export function loadConfig(): Config {
     hlApiUrl,
     testnet,
     turnkey: turnkeyConfigured ? tk : null,
-    rawPrivateKey: rawKey && rawKey.startsWith("0x") ? (rawKey as `0x${string}`) : null,
+    signerMode: signerEnv ?? "auto",
+    localWallet: {
+      privateKey: rawKey && rawKey.startsWith("0x") ? (rawKey as `0x${string}`) : null,
+      mnemonic: mnemonic || null,
+      accountIndex: Number(process.env.WALLET_ACCOUNT_INDEX ?? "0"),
+    },
     telegram: tgToken !== "" && tgChatId !== "" ? { token: tgToken, chatId: tgChatId } : null,
     watchWhitelist: (process.env.WATCH_WHITELIST ?? "")
       .split(",")

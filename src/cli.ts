@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { ExchangeClient, HttpTransport } from "@nktkas/hyperliquid";
 import { loadConfig } from "./config.js";
-import { loadAccount } from "./wallet.js";
+import { newLocalWallet, resolveSigner } from "./wallet.js";
 import { Watcher, parseMarketSlug, type SlugSpec } from "./watch.js";
 import {
   HyperliquidInfo,
@@ -22,15 +22,15 @@ import {
 const cfg = loadConfig();
 const info = new HyperliquidInfo(cfg.hlApiUrl);
 
-async function exchangeClient(): Promise<{ exchange: ExchangeClient; address: string }> {
-  const account = await loadAccount(cfg);
+async function exchangeClient(): Promise<{ exchange: ExchangeClient; address: string; kind: string }> {
+  const { account, kind } = await resolveSigner(cfg);
   const transport = new HttpTransport({ isTestnet: cfg.testnet });
-  return { exchange: new ExchangeClient({ transport, wallet: account }), address: account.address };
+  return { exchange: new ExchangeClient({ transport, wallet: account }), address: account.address, kind };
 }
 
 /** Signer address without constructing the exchange client (info-only commands). */
 async function signerAddress(): Promise<string> {
-  const account = await loadAccount(cfg);
+  const { account } = await resolveSigner(cfg);
   return account.address;
 }
 
@@ -65,8 +65,8 @@ async function placeOrder(outcome: number, side: Side, isBuy: boolean, px: numbe
   console.log(`${isBuy ? "BUY" : "SELL"} ${size} ${sideName(side)} @ ${limitPx} (${tif}) on ${coin} — ${label}`);
   if (cfg.testnet) console.log("(testnet)");
 
-  const { exchange, address } = await exchangeClient();
-  console.log(`signer: ${address}${cfg.turnkey ? " (turnkey)" : " (raw key)"}`);
+  const { exchange, address, kind } = await exchangeClient();
+  console.log(`signer: ${address} (${kind})`);
 
   const res = await exchange.order({
     orders: [
@@ -103,11 +103,35 @@ program
   .command("whoami")
   .description("Show the signing address and its USDC spot balance")
   .action(async () => {
-    const address = await signerAddress();
-    console.log(`address: ${address} ${cfg.turnkey ? "(turnkey)" : "(raw key)"}${cfg.testnet ? " [testnet]" : ""}`);
-    const balances = await info.spotBalances(address);
+    const { account, kind } = await resolveSigner(cfg);
+    console.log(`address: ${account.address} (${kind})${cfg.testnet ? " [testnet]" : ""}`);
+    const balances = await info.spotBalances(account.address);
     const usdc = balances.find((b) => b.coin === "USDC");
     console.log(`USDC: total=${usdc?.total ?? "0"} hold=${usdc?.hold ?? "0"}`);
+  });
+
+program
+  .command("wallet")
+  .description("Local wallet utilities")
+  .command("new")
+  .description("Generate a new local wallet (hot-wallet grade — use Turnkey for real funds)")
+  .option("--save", "write WALLET_PRIVATE_KEY to .env (refuses to overwrite an existing one)")
+  .action(async (opts: { save?: boolean }) => {
+    const { privateKey, address } = newLocalWallet();
+    console.log(`address:     ${address}`);
+    if (!opts.save) {
+      console.log(`private key: ${privateKey}`);
+      console.log("store it safely; pass --save to write it to .env instead of printing");
+      return;
+    }
+    const { readFile, writeFile } = await import("node:fs/promises");
+    const envPath = new URL("../.env", import.meta.url).pathname;
+    const existing = await readFile(envPath, "utf8").catch(() => "");
+    if (/^\s*WALLET_PRIVATE_KEY\s*=\s*0x/m.test(existing)) {
+      throw new Error(".env already has a WALLET_PRIVATE_KEY — refusing to overwrite it");
+    }
+    await writeFile(envPath, `${existing}${existing.endsWith("\n") || existing === "" ? "" : "\n"}WALLET_PRIVATE_KEY=${privateKey}\n`);
+    console.log("private key: saved to .env as WALLET_PRIVATE_KEY (not printed)");
   });
 
 program
