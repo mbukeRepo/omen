@@ -1,14 +1,17 @@
 import { Telegram } from "./telegram.js";
 import {
   HyperliquidInfo,
+  NO,
   YES,
   decodeCoin,
   describeOutcome,
   encodeCoin,
   outcomeExpiryMs,
   parseDescription,
+  sideName,
   type HlOutcome,
   type OutcomeMeta,
+  type Side,
 } from "./hyperliquid.js";
 
 export interface WatchOptions {
@@ -79,6 +82,11 @@ interface Tracked {
   start: number; // YES mid at session start (for heartbeat digests)
   baseline: number; // YES mid at last alert — alerts measure moves from here
   last: number;
+  // NO has its own book and mid (not exactly 1 - YES); tracked for display,
+  // but alerts trigger on YES only — a NO trigger would mirror every alert.
+  startNo: number;
+  baselineNo: number;
+  lastNo: number;
 }
 
 const META_REFRESH_MS = 10 * 60_000;
@@ -181,7 +189,7 @@ export class Watcher {
     return [...set];
   }
 
-  private track(outcome: number, mid: number): Tracked {
+  private track(outcome: number, mid: number, noMid: number = 1 - mid): Tracked {
     const o = this.meta.outcomes.find((x) => x.outcome === outcome);
     const t: Tracked = {
       outcome,
@@ -191,28 +199,35 @@ export class Watcher {
       start: mid,
       baseline: mid,
       last: mid,
+      startNo: noMid,
+      baselineNo: noMid,
+      lastNo: noMid,
     };
     this.tracked.set(outcome, t);
     return t;
   }
 
-  /** Live top of book for the YES token, e.g. "bid 0.5800 x 220 | ask 0.5900 x 64". */
-  private async topOfBook(outcome: number): Promise<string | null> {
-    try {
-      const b = await this.info.l2Book(encodeCoin(outcome, YES));
-      const fmt = (l?: { px: number; sz: number }) => (l ? `${l.px.toFixed(4)} x ${l.sz}` : "—");
-      return `bid ${fmt(b.bids[0])} | ask ${fmt(b.asks[0])}`;
-    } catch {
-      return null;
-    }
+  /** Live top of both books, e.g. "YES bid 0.5800 x 220 | ask 0.5900 x 64". */
+  private async topOfBook(outcome: number): Promise<string[]> {
+    const fmt = (l?: { px: number; sz: number }) => (l ? `${l.px.toFixed(4)} x ${l.sz}` : "—");
+    const side = async (s: Side) => {
+      try {
+        const b = await this.info.l2Book(encodeCoin(outcome, s));
+        return `${sideName(s)} bid ${fmt(b.bids[0])} | ask ${fmt(b.asks[0])}`;
+      } catch {
+        return null;
+      }
+    };
+    const [yes, no] = await Promise.all([side(YES), side(NO)]);
+    return [yes, no].filter((x): x is string => x !== null);
   }
 
   /** Full detail block for one market, used by startup, alerts and heartbeats. */
   private async detailBlock(t: Tracked, headline: string): Promise<string> {
-    const lines = [headline];
-    const book = await this.topOfBook(t.outcome);
-    if (book) lines.push(book);
-    if (t.last !== t.start) lines.push(`session: ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})`);
+    const lines = [headline, ...(await this.topOfBook(t.outcome))];
+    if (t.last !== t.start) {
+      lines.push(`session: YES ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})`);
+    }
     const exp = expiryLine(t.expiryMs);
     if (exp) lines.push(exp);
     if (t.url) lines.push(t.url);
@@ -232,7 +247,8 @@ export class Watcher {
           [
             `🏁 ${t.label}  [#${t.outcome}]`,
             `no longer quoted — resolved or delisted`,
-            `last YES ${t.last.toFixed(4)} | session: ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})`,
+            `last YES ${t.last.toFixed(4)} | NO ${t.lastNo.toFixed(4)}`,
+            `session: YES ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})`,
             ...(t.url ? [t.url] : []),
           ].join("\n"),
         );
@@ -240,8 +256,12 @@ export class Watcher {
         continue;
       }
       const mid = Number(raw);
+      const rawNo = mids[encodeCoin(t.outcome, NO)];
+      const noMid = rawNo !== undefined ? Number(rawNo) : 1 - mid;
       const prevBaseline = t.baseline;
+      const prevBaselineNo = t.baselineNo;
       t.last = mid;
+      t.lastNo = noMid;
       const movedPp = Math.abs(mid - prevBaseline) * 100;
       const movedPct = prevBaseline > 0 ? (Math.abs(mid - prevBaseline) / prevBaseline) * 100 : Number.POSITIVE_INFINITY;
       const moved = this.opts.asPoints ? movedPp : movedPct;
@@ -250,10 +270,15 @@ export class Watcher {
         this.notify(
           await this.detailBlock(
             t,
-            `${arrow} ${t.label}  [#${t.outcome}]\nYES ${prevBaseline.toFixed(4)} → ${mid.toFixed(4)}  (${describeMove(prevBaseline, mid)})`,
+            [
+              `${arrow} ${t.label}  [#${t.outcome}]`,
+              `YES ${prevBaseline.toFixed(4)} → ${mid.toFixed(4)}  (${describeMove(prevBaseline, mid)})`,
+              `NO  ${prevBaselineNo.toFixed(4)} → ${noMid.toFixed(4)}  (${describeMove(prevBaselineNo, noMid)})`,
+            ].join("\n"),
           ),
         );
         t.baseline = mid;
+        t.baselineNo = noMid;
       }
     }
   }
@@ -265,8 +290,11 @@ export class Watcher {
       if (!this.opts.all && !this.matchesPattern(o)) continue;
       const raw = mids[encodeCoin(o.outcome, YES)];
       if (raw === undefined) continue;
-      const t = this.track(o.outcome, Number(raw));
-      this.notify(await this.detailBlock(t, `🆕 listed: ${t.label}  [#${t.outcome}]\nYES ${t.start.toFixed(4)}`));
+      const rawNo = mids[encodeCoin(o.outcome, NO)];
+      const t = this.track(o.outcome, Number(raw), rawNo !== undefined ? Number(rawNo) : undefined);
+      this.notify(
+        await this.detailBlock(t, `🆕 listed: ${t.label}  [#${t.outcome}]\nYES ${t.start.toFixed(4)} | NO ${t.startNo.toFixed(4)}`),
+      );
     }
   }
 
@@ -282,7 +310,8 @@ export class Watcher {
         const exp = expiryLine(t.expiryMs);
         return [
           `• ${t.label}  [#${t.outcome}]`,
-          `  YES ${t.last.toFixed(4)} | session: ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})${exp ? `\n  ${exp}` : ""}`,
+          `  YES ${t.last.toFixed(4)} | NO ${t.lastNo.toFixed(4)}`,
+          `  session: YES ${t.start.toFixed(4)} → ${t.last.toFixed(4)} (${describeMove(t.start, t.last)})${exp ? `\n  ${exp}` : ""}`,
         ].join("\n");
       });
     this.notify(
@@ -301,8 +330,9 @@ export class Watcher {
         console.warn(`#${outcome}: no live YES mid — skipping (resolved or unknown outcome?)`);
         continue;
       }
-      const t = this.track(outcome, Number(raw));
-      console.log(`watching #${t.outcome} YES ${t.start.toFixed(4)} — ${t.label}`);
+      const rawNo = mids[encodeCoin(outcome, NO)];
+      const t = this.track(outcome, Number(raw), rawNo !== undefined ? Number(rawNo) : undefined);
+      console.log(`watching #${t.outcome} YES ${t.start.toFixed(4)} / NO ${t.startNo.toFixed(4)} — ${t.label}`);
     }
     if (this.tracked.size === 0) throw new Error("nothing to watch");
 
@@ -312,7 +342,7 @@ export class Watcher {
     // Full per-market details for small watchlists; headline-only beyond that.
     const detailed = [...this.tracked.values()].slice(0, 10);
     const blocks = await Promise.all(
-      detailed.map((t) => this.detailBlock(t, `• ${t.label}  [#${t.outcome}]\nYES ${t.start.toFixed(4)}`)),
+      detailed.map((t) => this.detailBlock(t, `• ${t.label}  [#${t.outcome}]\nYES ${t.start.toFixed(4)} | NO ${t.startNo.toFixed(4)}`)),
     );
     const overflow = this.tracked.size - detailed.length;
     this.notify([header, ...blocks, ...(overflow > 0 ? [`…and ${overflow} more`] : [])].join("\n\n"));
