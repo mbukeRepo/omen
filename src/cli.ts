@@ -509,7 +509,7 @@ program
   .option("--temp <t>", "sampling temperature", "1.0")
   .option("--days <n>", "history window in days", "90")
   .option("--model <m>", "mini | small | base (mini has 4x the context)", "small")
-  .option("--source <s>", "candle source: binance | okx | hl", "binance")
+  .option("--source <s>", "candle source: binance | okx | bybit | coinbase | kraken | hl", "binance")
   .action(async (market: string, opts: { paths: string; temp: string; days: string; model: string; source: string }) => {
     const variant = KRONOS_MODELS[opts.model];
     if (!variant) throw new Error(`--model must be mini, small or base, got "${opts.model}"`);
@@ -545,19 +545,8 @@ program
       `history: ${days}d of ${interval} bars from ${opts.source} (${lookback} bars, Kronos-${opts.model}) → predict ${predLen} bars x ${opts.paths} paths`,
     );
 
-    let raw: { t: number; o: string; h: string; l: string; c: string; v: string }[];
-    const fromMs = now - intervalMs * (lookback + 2);
-    if (opts.source === "binance") {
-      const { binanceKlines, binanceSymbol } = await import("./binance.js");
-      raw = await binanceKlines(binanceSymbol(fields.underlying), interval, fromMs, now);
-    } else if (opts.source === "okx") {
-      const { okxCandles, okxInstId } = await import("./okx.js");
-      raw = await okxCandles(okxInstId(fields.underlying), interval, fromMs, now);
-    } else if (opts.source === "hl") {
-      raw = await info.candles(fields.underlying, interval, fromMs, now);
-    } else {
-      throw new Error(`--source must be binance, okx or hl, got "${opts.source}"`);
-    }
+    const { fetchCandles } = await import("./candles.js");
+    const raw = await fetchCandles(opts.source, info, fields.underlying, interval, now - intervalMs * (lookback + 2), now);
     // Last candle is still forming; drop it so the model sees only closed bars.
     const closed = raw.slice(0, -1).slice(-lookback);
     if (closed.length < 50) throw new Error(`only ${closed.length} ${interval} candles from ${opts.source} — not enough history`);
@@ -615,7 +604,7 @@ program
   .option("--trials <n>", "number of historical days to test", "60")
   .option("-n, --paths <n>", "sampled paths per trial", "50")
   .option("--model <m>", "mini | small | base", "mini")
-  .option("--source <s>", "binance | okx | hl", "binance")
+  .option("--source <s>", "binance | okx | bybit | coinbase | kraken | hl", "binance")
   .option("--offsets <list>", "strike offsets vs spot, %", "-1,-0.5,0,0.5,1")
   .action(async (underlying: string, opts: { trials: string; paths: string; model: string; source: string; offsets: string }) => {
     const variant = KRONOS_MODELS[opts.model];
@@ -632,16 +621,8 @@ program
     const fromMs = now - intervalMs * needBars;
     console.log(`backtest ${underlying}: ${nTrials} daily trials x ${offsets.length} strikes, ${opts.paths} paths, Kronos-${opts.model}, ${opts.source} ${interval} bars`);
 
-    let raw: { t: number; o: string; h: string; l: string; c: string; v: string }[];
-    if (opts.source === "binance") {
-      const { binanceKlines, binanceSymbol } = await import("./binance.js");
-      raw = await binanceKlines(binanceSymbol(underlying), interval, fromMs, now);
-    } else if (opts.source === "okx") {
-      const { okxCandles, okxInstId } = await import("./okx.js");
-      raw = await okxCandles(okxInstId(underlying), interval, fromMs, now);
-    } else {
-      raw = await info.candles(underlying.toUpperCase(), interval, fromMs, now);
-    }
+    const { fetchCandles } = await import("./candles.js");
+    const raw = await fetchCandles(opts.source, info, underlying, interval, fromMs, now);
     const candles = raw.slice(0, -1); // drop forming bar
     console.log(`${candles.length} closed bars fetched`);
 
