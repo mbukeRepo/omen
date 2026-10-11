@@ -65,7 +65,7 @@ def main() -> None:
     device = pick_device()
     tokenizer = KronosTokenizer.from_pretrained(req.get("tokenizer", "NeoQuasar/Kronos-Tokenizer-base"))
     model = Kronos.from_pretrained(req.get("model", "NeoQuasar/Kronos-small"))
-    predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+    predictor = KronosPredictor(model, tokenizer, device=device, max_context=int(req.get("maxContext", 512)))
 
     # sample_count=1 per batch entry -> each result is one independent path,
     # which is what turns the forecast into a probability estimate.

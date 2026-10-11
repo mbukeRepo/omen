@@ -494,14 +494,28 @@ const INTERVALS: [string, number][] = [
   ["1d", 86_400_000],
 ];
 
+/** Kronos variants; context length caps how many history bars the model actually sees. */
+const KRONOS_MODELS: Record<string, { model: string; tokenizer: string; ctx: number }> = {
+  mini: { model: "NeoQuasar/Kronos-mini", tokenizer: "NeoQuasar/Kronos-Tokenizer-2k", ctx: 2048 },
+  small: { model: "NeoQuasar/Kronos-small", tokenizer: "NeoQuasar/Kronos-Tokenizer-base", ctx: 512 },
+  base: { model: "NeoQuasar/Kronos-base", tokenizer: "NeoQuasar/Kronos-Tokenizer-base", ctx: 512 },
+};
+
 program
   .command("forecast")
   .description("Kronos model probability for a price-binary market vs the market's own YES mid")
   .argument("<market>", "outcome index or app.hyperliquid.xyz trade URL (price binaries only)")
   .option("-n, --paths <n>", "independent forecast paths to sample", "30")
   .option("--temp <t>", "sampling temperature", "1.0")
-  .option("--lookback <bars>", "history bars fed to the model", "400")
-  .action(async (market: string, opts: { paths: string; temp: string; lookback: string }) => {
+  .option("--days <n>", "history window in days", "90")
+  .option("--model <m>", "mini | small | base (mini has 4x the context)", "small")
+  .option("--source <s>", "candle source: binance | hl", "binance")
+  .action(async (market: string, opts: { paths: string; temp: string; days: string; model: string; source: string }) => {
+    const variant = KRONOS_MODELS[opts.model];
+    if (!variant) throw new Error(`--model must be mini, small or base, got "${opts.model}"`);
+    const days = Number(opts.days);
+    if (!(days > 0)) throw new Error(`--days must be > 0, got "${opts.days}"`);
+
     const { outcome, label } = await resolveMarket(market);
     const meta = await info.outcomeMeta();
     const o = meta.outcomes.find((x) => x.outcome === outcome);
@@ -511,22 +525,38 @@ program
     const now = Date.now();
     const toExpiry = fields.expiryMs - now;
     if (toExpiry <= 0) throw new Error(`#${outcome} already expired`);
-    // Pick the finest interval that keeps the forecast horizon within ~120 bars.
+
+    // Finest interval whose bar count over the history window roughly fits the model
+    // context (25% overflow allowed — the predictor keeps the newest ctx bars anyway).
+    const windowMs = days * 86_400_000;
     const [interval, intervalMs] =
-      INTERVALS.find(([, ms]) => Math.ceil(toExpiry / ms) <= 120) ?? INTERVALS[INTERVALS.length - 1]!;
+      INTERVALS.find(([, ms]) => windowMs / ms <= variant.ctx * 1.25) ?? INTERVALS[INTERVALS.length - 1]!;
+    const lookback = Math.min(variant.ctx, Math.floor(windowMs / intervalMs));
     const predLen = Math.max(1, Math.ceil(toExpiry / intervalMs));
-    const lookback = Number(opts.lookback);
+    if (predLen > 240) {
+      throw new Error(`horizon is ${predLen} ${interval} bars — too far out for a stable sample; reduce --days or use --model mini`);
+    }
 
     console.log(`${label}  [#${outcome}]`);
     console.log(
-      `underlying ${fields.underlying}, strike ${fields.threshold}, expires in ${(toExpiry / 3_600_000).toFixed(1)}h ` +
-        `→ ${predLen} x ${interval} bars, ${opts.paths} paths`,
+      `underlying ${fields.underlying}, strike ${fields.threshold}, expires in ${(toExpiry / 3_600_000).toFixed(1)}h`,
+    );
+    console.log(
+      `history: ${days}d of ${interval} bars from ${opts.source} (${lookback} bars, Kronos-${opts.model}) → predict ${predLen} bars x ${opts.paths} paths`,
     );
 
-    const candles = await info.candles(fields.underlying, interval, now - intervalMs * (lookback + 2), now);
+    let raw: { t: number; o: string; h: string; l: string; c: string; v: string }[];
+    if (opts.source === "binance") {
+      const { binanceKlines, binanceSymbol } = await import("./binance.js");
+      raw = await binanceKlines(binanceSymbol(fields.underlying), interval, now - intervalMs * (lookback + 2), now);
+    } else if (opts.source === "hl") {
+      raw = await info.candles(fields.underlying, interval, now - intervalMs * (lookback + 2), now);
+    } else {
+      throw new Error(`--source must be binance or hl, got "${opts.source}"`);
+    }
     // Last candle is still forming; drop it so the model sees only closed bars.
-    const closed = candles.slice(0, -1).slice(-lookback);
-    if (closed.length < 50) throw new Error(`only ${closed.length} ${interval} candles for ${fields.underlying} — not enough history`);
+    const closed = raw.slice(0, -1).slice(-lookback);
+    if (closed.length < 50) throw new Error(`only ${closed.length} ${interval} candles from ${opts.source} — not enough history`);
 
     const { spawnSync } = await import("node:child_process");
     const kronosDir = new URL("../kronos", import.meta.url).pathname;
@@ -540,6 +570,9 @@ program
         threshold: fields.threshold,
         paths: Number(opts.paths),
         temperature: Number(opts.temp),
+        model: variant.model,
+        tokenizer: variant.tokenizer,
+        maxContext: variant.ctx,
       }),
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
