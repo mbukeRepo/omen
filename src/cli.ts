@@ -609,6 +609,96 @@ program
   });
 
 program
+  .command("backtest")
+  .description("Validate Kronos probabilities on historical data: daily 24h binaries at strikes around spot")
+  .argument("[underlying]", "coin, e.g. BTC or ETH", "BTC")
+  .option("--trials <n>", "number of historical days to test", "60")
+  .option("-n, --paths <n>", "sampled paths per trial", "50")
+  .option("--model <m>", "mini | small | base", "mini")
+  .option("--source <s>", "binance | okx | hl", "binance")
+  .option("--offsets <list>", "strike offsets vs spot, %", "-1,-0.5,0,0.5,1")
+  .action(async (underlying: string, opts: { trials: string; paths: string; model: string; source: string; offsets: string }) => {
+    const variant = KRONOS_MODELS[opts.model];
+    if (!variant) throw new Error(`--model must be mini, small or base, got "${opts.model}"`);
+    const nTrials = Number(opts.trials);
+    const offsets = opts.offsets.split(",").map((s) => Number(s) / 100);
+    const interval = "4h";
+    const intervalMs = 4 * 3_600_000;
+    const predLen = 6; // 24h horizon
+    const lookback = Math.min(variant.ctx, 512);
+
+    const now = Date.now();
+    const needBars = lookback + nTrials * predLen + predLen + 4;
+    const fromMs = now - intervalMs * needBars;
+    console.log(`backtest ${underlying}: ${nTrials} daily trials x ${offsets.length} strikes, ${opts.paths} paths, Kronos-${opts.model}, ${opts.source} ${interval} bars`);
+
+    let raw: { t: number; o: string; h: string; l: string; c: string; v: string }[];
+    if (opts.source === "binance") {
+      const { binanceKlines, binanceSymbol } = await import("./binance.js");
+      raw = await binanceKlines(binanceSymbol(underlying), interval, fromMs, now);
+    } else if (opts.source === "okx") {
+      const { okxCandles, okxInstId } = await import("./okx.js");
+      raw = await okxCandles(okxInstId(underlying), interval, fromMs, now);
+    } else {
+      raw = await info.candles(underlying.toUpperCase(), interval, fromMs, now);
+    }
+    const candles = raw.slice(0, -1); // drop forming bar
+    console.log(`${candles.length} closed bars fetched`);
+
+    // Trials anchored at 00:00 UTC bars: context ends there, outcome = close 24h later.
+    const trials: { end: number; strikes: number[]; outcome: number }[] = [];
+    for (let i = candles.length - 1; i >= lookback && trials.length < nTrials; i--) {
+      if (candles[i]!.t % 86_400_000 !== 0) continue;
+      if (i + predLen - 1 >= candles.length) continue;
+      const spot = Number(candles[i - 1]!.c);
+      trials.push({ end: i, strikes: offsets.map((o) => spot * (1 + o)), outcome: i + predLen - 1 });
+    }
+    trials.reverse();
+    if (trials.length < 10) throw new Error(`only ${trials.length} usable trials — not enough history from ${opts.source}`);
+    console.log(`${trials.length} trials, running (model load + ${trials.length * Number(opts.paths)} sampled paths)…`);
+
+    const { spawnSync } = await import("node:child_process");
+    const kronosDir = new URL("../kronos", import.meta.url).pathname;
+    const res = spawnSync(`${kronosDir}/venv/bin/python`, [`${kronosDir}/backtest.py`], {
+      input: JSON.stringify({
+        candles,
+        trials,
+        lookback,
+        predLen,
+        intervalMs,
+        paths: Number(opts.paths),
+        model: variant.model,
+        tokenizer: variant.tokenizer,
+        maxContext: variant.ctx,
+      }),
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: 60 * 60_000,
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    if (res.error || res.status !== 0) throw new Error(`backtest sidecar failed: ${res.error?.message ?? res.status}`);
+    const out = JSON.parse(res.stdout.trim().split("\n").pop()!) as {
+      device: string;
+      trials: number;
+      predictions: number;
+      brier: number;
+      brierAlways50: number;
+      brierClimatology: number;
+      accuracy: number;
+      baseRate: number;
+      calibration: { bucket: string; n: number; meanProb: number; freq: number }[];
+    };
+
+    console.log(`\n${out.predictions} predictions over ${out.trials} days (${out.device})`);
+    console.log(`Brier score:        ${out.brier.toFixed(4)}  (lower is better)`);
+    console.log(`  always-50% ref:   ${out.brierAlways50.toFixed(4)}`);
+    console.log(`  climatology ref:  ${out.brierClimatology.toFixed(4)}  (base rate ${out.baseRate.toFixed(3)})`);
+    console.log(`Accuracy @0.5:      ${(out.accuracy * 100).toFixed(1)}%`);
+    console.log(`\nCalibration (model says → actually happens):`);
+    console.table(out.calibration.map((b) => ({ "model says": b.bucket, n: b.n, "mean prob": b.meanProb.toFixed(3), "actual freq": b.freq.toFixed(3) })));
+  });
+
+program
   .command("watch")
   .description("Track YES mids and send a Telegram channel alert when a market moves past a threshold")
   .argument(
