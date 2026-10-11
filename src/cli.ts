@@ -699,6 +699,100 @@ program
   });
 
 program
+  .command("replay")
+  .description("Replay last week's HL daily binaries (reconstructed 06:00 UTC listings) and score the model")
+  .option("--days <n>", "days back to replay", "7")
+  .option("-n, --paths <n>", "sampled paths per market", "50")
+  .option("--model <m>", "mini | small | base", "mini")
+  .option("--underlyings <list>", "comma-separated coins", "BTC,ETH,SOL,HYPE")
+  .action(async (opts: { days: string; paths: string; model: string; underlyings: string }) => {
+    const variant = KRONOS_MODELS[opts.model];
+    if (!variant) throw new Error(`--model must be mini, small or base, got "${opts.model}"`);
+    const days = Number(opts.days);
+    const hourMs = 3_600_000;
+    const predLen = 24;
+    const now = Date.now();
+    const { spawnSync } = await import("node:child_process");
+    const kronosDir = new URL("../kronos", import.meta.url).pathname;
+
+    interface Row {
+      coin: string;
+      listed: string;
+      strike: number;
+      prob: number;
+      settle: number;
+      y: number;
+    }
+    const rows: Row[] = [];
+
+    for (const coin of opts.underlyings.split(",").map((s) => s.trim().toUpperCase())) {
+      const fromMs = now - hourMs * (variant.ctx + (days + 2) * 24);
+      const raw = await info.candles(coin, "1h", fromMs, now);
+      const candles = raw.slice(0, -1);
+      const idxByT = new Map(candles.map((c, i) => [c.t, i]));
+
+      const trials: { end: number; strikes: number[]; outcome: number }[] = [];
+      for (let d = days; d >= 1; d--) {
+        const listMs = Math.floor((now - d * 86_400_000) / 86_400_000) * 86_400_000 + 6 * hourMs;
+        const expiryMs = listMs + 86_400_000;
+        if (expiryMs > now) continue;
+        const end = idxByT.get(listMs);
+        const outcome = idxByT.get(expiryMs - hourMs);
+        if (end === undefined || outcome === undefined || outcome !== end + predLen - 1) continue;
+        trials.push({ end, strikes: [Number(candles[end - 1]!.c)], outcome });
+      }
+      if (trials.length === 0) {
+        console.warn(`${coin}: no usable trials (not enough HL candle history)`);
+        continue;
+      }
+      const lookback = Math.min(variant.ctx, Math.min(...trials.map((t) => t.end)));
+      console.log(`${coin}: ${trials.length} markets, lookback ${lookback} 1h bars, ${opts.paths} paths…`);
+
+      const res = spawnSync(`${kronosDir}/venv/bin/python`, [`${kronosDir}/backtest.py`], {
+        input: JSON.stringify({
+          candles,
+          trials,
+          lookback,
+          predLen,
+          intervalMs: hourMs,
+          paths: Number(opts.paths),
+          model: variant.model,
+          tokenizer: variant.tokenizer,
+          maxContext: variant.ctx,
+        }),
+        encoding: "utf8",
+        maxBuffer: 256 * 1024 * 1024,
+        timeout: 60 * 60_000,
+        stdio: ["pipe", "pipe", "inherit"],
+      });
+      if (res.error || res.status !== 0) throw new Error(`replay sidecar failed for ${coin}: ${res.error?.message ?? res.status}`);
+      const out = JSON.parse(res.stdout.trim().split("\n").pop()!) as {
+        results: { t: number; spot: number; strike: number; prob: number; y: number }[];
+      };
+      for (const [i, r] of out.results.entries()) {
+        const settle = Number(candles[trials[i]!.outcome]!.c);
+        rows.push({ coin, listed: new Date(r.t).toISOString().slice(5, 10), strike: r.strike, prob: r.prob, settle, y: r.y });
+      }
+    }
+
+    if (rows.length === 0) throw new Error("no markets replayed");
+    console.log(`\nreconstructed HL daily binaries, model as-of listing (Kronos-${opts.model}, HL 1h candles):`);
+    console.table(
+      rows.map((r) => ({
+        market: `${r.coin} >= ${r.strike} (${r.listed})`,
+        "model P(YES)": r.prob.toFixed(2),
+        settle: r.settle,
+        resolved: r.y ? "YES" : "NO",
+        hit: (r.prob > 0.5) === (r.y > 0.5) ? "✓" : "✗",
+      })),
+    );
+    const brier = rows.reduce((a, r) => a + (r.prob - r.y) ** 2, 0) / rows.length;
+    const acc = rows.filter((r) => (r.prob > 0.5) === (r.y > 0.5)).length / rows.length;
+    const yesRate = rows.reduce((a, r) => a + r.y, 0) / rows.length;
+    console.log(`\n${rows.length} markets | Brier ${brier.toFixed(4)} (always-50% = 0.25) | accuracy ${(acc * 100).toFixed(0)}% | YES base rate ${yesRate.toFixed(2)}`);
+  });
+
+program
   .command("watch")
   .description("Track YES mids and send a Telegram channel alert when a market moves past a threshold")
   .argument(
