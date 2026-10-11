@@ -93,6 +93,19 @@ recurring listings (hourly BTC binaries) keep getting picked up. It's a long-run
 foreground process — run it in the background (`nohup ... > watch.log 2>&1 &`) and check
 `watch.log`.
 
+## Model forecasts (Kronos)
+
+```sh
+hip4 forecast 10997            # or a trade URL; price binaries ("X >= K at T") only
+hip4 forecast 10997 -n 100     # more sampled paths = steadier probability
+```
+
+Runs the local Kronos candlestick model (`./kronos/setup.sh` once to install) and prints
+model P(YES) vs the market's YES mid plus the edge in probability points. Read-only and
+safe to run; takes a minute or two. Present the result as a model estimate with its
+caveats, never as a trade instruction, and never trade on it without the user's explicit
+go-ahead.
+
 ## HIP-4 encoding (for debugging raw data)
 
 - Book coin for (outcome, side): `#(10*outcome + side)`, side 0=YES 1=NO

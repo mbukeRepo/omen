@@ -120,6 +120,21 @@ export function describeOutcome(o: HlOutcome, questions: HlQuestion[]): string {
   }
 }
 
+/** Strike/underlying/expiry for daily+hourly price binaries; null for other market types. */
+export function priceBinaryFields(
+  o: HlOutcome,
+): { underlying: string; threshold: number; expiryMs: number } | null {
+  const d = parseDescription(o.description);
+  const isTemplate = o.name === "template:binaryPrice" || o.name === "template:binaryPriceExternal";
+  const isClass = d.class === "priceBinary";
+  if (!isTemplate && !isClass) return null;
+  const underlying = (isTemplate ? d.perp : d.underlying) ?? "";
+  const threshold = Number(isTemplate ? d.threshold : d.targetPrice);
+  const expiryMs = parseHlTime(isTemplate ? d.time : d.expiry);
+  if (!underlying || !Number.isFinite(threshold) || expiryMs === null) return null;
+  return { underlying, threshold, expiryMs };
+}
+
 interface RawLevel {
   px: string;
   sz: string;
@@ -203,6 +218,19 @@ export class HyperliquidInfo {
 
   async openOrders(user: string): Promise<OpenOrder[]> {
     return this.info<OpenOrder[]>({ type: "frontendOpenOrders", user });
+  }
+
+  /** Candles for a regular coin (e.g. "BTC"); interval like "5m" | "15m" | "1h" | "4h" | "1d". */
+  async candles(
+    coin: string,
+    interval: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<{ t: number; o: string; h: string; l: string; c: string; v: string }[]> {
+    return this.info<{ t: number; o: string; h: string; l: string; c: string; v: string }[]>({
+      type: "candleSnapshot",
+      req: { coin, interval, startTime: startMs, endTime: endMs },
+    });
   }
 
   /** Perps account value in USDC (deposits land here before `move`ing to spot). */

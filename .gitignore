@@ -3,3 +3,5 @@ dist/
 .env
 *.log
 .tmp/
+kronos/venv/
+kronos/vendor/

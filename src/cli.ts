@@ -15,6 +15,7 @@ import {
   encodeCoin,
   outcomeExpiryMs,
   parseSide,
+  priceBinaryFields,
   sideName,
   type OutcomeMeta,
   type Side,
@@ -484,6 +485,91 @@ function classifyWatchEntries(entries: string[]): { indices: number[]; slugs: Sl
   }
   return { indices, slugs, patterns };
 }
+
+const INTERVALS: [string, number][] = [
+  ["5m", 5 * 60_000],
+  ["15m", 15 * 60_000],
+  ["1h", 3_600_000],
+  ["4h", 4 * 3_600_000],
+  ["1d", 86_400_000],
+];
+
+program
+  .command("forecast")
+  .description("Kronos model probability for a price-binary market vs the market's own YES mid")
+  .argument("<market>", "outcome index or app.hyperliquid.xyz trade URL (price binaries only)")
+  .option("-n, --paths <n>", "independent forecast paths to sample", "30")
+  .option("--temp <t>", "sampling temperature", "1.0")
+  .option("--lookback <bars>", "history bars fed to the model", "400")
+  .action(async (market: string, opts: { paths: string; temp: string; lookback: string }) => {
+    const { outcome, label } = await resolveMarket(market);
+    const meta = await info.outcomeMeta();
+    const o = meta.outcomes.find((x) => x.outcome === outcome);
+    const fields = o ? priceBinaryFields(o) : null;
+    if (!fields) throw new Error(`#${outcome} is not a price binary — forecast only supports "X >= K at T" markets`);
+
+    const now = Date.now();
+    const toExpiry = fields.expiryMs - now;
+    if (toExpiry <= 0) throw new Error(`#${outcome} already expired`);
+    // Pick the finest interval that keeps the forecast horizon within ~120 bars.
+    const [interval, intervalMs] =
+      INTERVALS.find(([, ms]) => Math.ceil(toExpiry / ms) <= 120) ?? INTERVALS[INTERVALS.length - 1]!;
+    const predLen = Math.max(1, Math.ceil(toExpiry / intervalMs));
+    const lookback = Number(opts.lookback);
+
+    console.log(`${label}  [#${outcome}]`);
+    console.log(
+      `underlying ${fields.underlying}, strike ${fields.threshold}, expires in ${(toExpiry / 3_600_000).toFixed(1)}h ` +
+        `→ ${predLen} x ${interval} bars, ${opts.paths} paths`,
+    );
+
+    const candles = await info.candles(fields.underlying, interval, now - intervalMs * (lookback + 2), now);
+    // Last candle is still forming; drop it so the model sees only closed bars.
+    const closed = candles.slice(0, -1).slice(-lookback);
+    if (closed.length < 50) throw new Error(`only ${closed.length} ${interval} candles for ${fields.underlying} — not enough history`);
+
+    const { spawnSync } = await import("node:child_process");
+    const kronosDir = new URL("../kronos", import.meta.url).pathname;
+    const python = `${kronosDir}/venv/bin/python`;
+    console.log("running Kronos (first run downloads model weights)…");
+    const res = spawnSync(python, [`${kronosDir}/forecast.py`], {
+      input: JSON.stringify({
+        candles: closed,
+        intervalMs,
+        predLen,
+        threshold: fields.threshold,
+        paths: Number(opts.paths),
+        temperature: Number(opts.temp),
+      }),
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 15 * 60_000,
+    });
+    if (res.error || res.status !== 0) {
+      throw new Error(
+        `forecast sidecar failed (run kronos/setup.sh first?): ${res.error?.message ?? ""}\n${(res.stderr ?? "").slice(-800)}`,
+      );
+    }
+    const out = JSON.parse(res.stdout.trim().split("\n").pop()!) as {
+      device: string;
+      probAbove: number;
+      lastClose: number;
+      finalClose: { q10: number; q50: number; q90: number; mean: number };
+    };
+
+    const mids = await info.allMids();
+    const yesMid = Number(mids[encodeCoin(outcome, YES)] ?? NaN);
+    const edge = out.probAbove - yesMid;
+
+    console.log(`\nspot now ${out.lastClose} | model final close q10 ${out.finalClose.q10.toFixed(0)} / q50 ${out.finalClose.q50.toFixed(0)} / q90 ${out.finalClose.q90.toFixed(0)} (${out.device})`);
+    console.log(`model P(YES):  ${out.probAbove.toFixed(3)}`);
+    console.log(`market YES mid: ${Number.isFinite(yesMid) ? yesMid.toFixed(3) : "?"}`);
+    if (Number.isFinite(yesMid)) {
+      const side = edge > 0 ? "YES looks cheap" : "NO looks cheap";
+      console.log(`edge: ${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}pp → ${Math.abs(edge) < 0.05 ? "no clear edge" : side}`);
+    }
+    console.log("(model estimate, not advice — small samples are noisy; close-vs-mark settlement differs)");
+  });
 
 program
   .command("watch")

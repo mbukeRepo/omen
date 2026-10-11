@@ -119,6 +119,27 @@ env vars it still runs, logging alerts to the console.
 Prices are probabilities in `(0, 1)`; sizes are contracts (each pays 1 USDC if it settles in
 your favor).
 
+### Kronos model forecasts
+
+`hip4 forecast <market>` prices a "X >= K at T" binary with
+[Kronos](https://github.com/shiyu-coder/Kronos), a foundation model for financial
+candlesticks (MIT, runs locally — Kronos-small on Apple MPS / CUDA / CPU). One-time setup:
+`./kronos/setup.sh` (venv + vendored repo; first forecast downloads the weights).
+
+It feeds the model recent OHLCV candles for the underlying, samples `-n` independent
+paths to expiry, and reports `P(final close >= strike)` next to the market's YES mid:
+
+```
+model P(YES):  0.100
+market YES mid: 0.517
+edge: -41.7pp → NO looks cheap
+```
+
+Treat it as a signal, not an oracle: with spot near the strike the true probability is
+near 0.5, so a large "edge" usually means model drift bias at that horizon rather than
+free money. More paths (`-n 100`) tightens the estimate; settlement uses the venue's
+mark/oracle at expiry, not a candle close.
+
 ### Order-book reads: API vs --rpc
 
 Default `book` reads full L2 depth from the info API (HyperCore via REST). With `--rpc`
