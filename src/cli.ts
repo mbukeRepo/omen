@@ -525,16 +525,28 @@ program
     console.log("running Kronos (first run downloads model weights)…");
     const out = await kronosForecast(info, fields, fopts);
 
+    // Fair value from the same source: current price (the forming 1h candle's
+    // close) and 7-day hourly realized vol.
+    const { fetchCandles } = await import("./candles.js");
+    const { digitalProb, realizedVol } = await import("./fairvalue.js");
+    const now = Date.now();
+    const hourly = await fetchCandles(fopts.source, info, fields.underlying, "1h", now - 170 * 3_600_000, now);
+    const spotNow = Number(hourly.at(-1)!.c);
+    const sigma = realizedVol(hourly.slice(0, -1).map((c) => Number(c.c)));
+    const fair = digitalProb(spotNow, fields.threshold, sigma, (fields.expiryMs - now) / 3_600_000);
+
     const mids = await info.allMids();
     const yesMid = Number(mids[encodeCoin(outcome, YES)] ?? NaN);
     const edge = out.probAbove - yesMid;
 
-    console.log(`\nspot now ${out.lastClose} | model final close q10 ${out.finalClose.q10.toFixed(0)} / q50 ${out.finalClose.q50.toFixed(0)} / q90 ${out.finalClose.q90.toFixed(0)} (${out.device})`);
-    console.log(`model P(YES):  ${out.probAbove.toFixed(3)}`);
-    console.log(`market YES mid: ${Number.isFinite(yesMid) ? yesMid.toFixed(3) : "?"}`);
+    console.log(`\nspot now ${spotNow} (${fopts.source}) vs strike ${fields.threshold} (${(((spotNow - fields.threshold) / fields.threshold) * 100).toFixed(2)}%)`);
+    console.log(`Kronos final close q10 ${out.finalClose.q10.toFixed(2)} / q50 ${out.finalClose.q50.toFixed(2)} / q90 ${out.finalClose.q90.toFixed(2)} (${out.device})`);
+    console.log(`fair value P(YES): ${fair.toFixed(3)}  (vol ${(sigma * 100).toFixed(3)}%/h)`);
+    console.log(`Kronos P(YES):     ${out.probAbove.toFixed(3)}`);
+    console.log(`market YES mid:    ${Number.isFinite(yesMid) ? yesMid.toFixed(3) : "?"}`);
     if (Number.isFinite(yesMid)) {
       const side = edge > 0 ? "YES looks cheap" : "NO looks cheap";
-      console.log(`edge: ${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}pp → ${Math.abs(edge) < 0.05 ? "no clear edge" : side}`);
+      console.log(`Kronos edge: ${edge >= 0 ? "+" : ""}${(edge * 100).toFixed(1)}pp → ${Math.abs(edge) < 0.05 ? "no clear edge" : side}`);
     }
     console.log("(model estimate, not advice — small samples are noisy; close-vs-mark settlement differs)");
   });
