@@ -170,10 +170,14 @@ mark/oracle at expiry, not a candle close.
 `hip4 bot` watches outcome-token prices every few seconds and trades dips:
 
 - **Entry:** a YES or NO token trades `--dip` % (default 5) below its highest price in
-  the last `--window` minutes (default 60). Before buying, Kronos must value the token
-  at or above the ask (`--edge` adds a margin), so a drop the model agrees with isn't
-  bought. Kronos re-runs per market every `--model-refresh` minutes (default 60) in the
-  background, so the model never pauses the price loop. `--no-model` trades raw dips.
+  the last `--window` minutes (default 60), and the gate values it at or above the ask
+  (`--edge` adds a margin).
+- **Gate** (`--gate`, default `fair`): the token's fair value as a digital option,
+  P(YES) = Φ(d₂), from the live Hyperliquid oracle spot, the strike, time left and 7-day
+  hourly realized volatility, repriced every tick. A dip that's just the market following
+  spot has no edge and is skipped; an overreaction with spot unchanged gets bought. In
+  60-day backtests this beat Kronos-small, which scored worse than always saying 50%.
+  `--gate kronos` uses Kronos (refreshed hourly in the background), `--gate none` trades raw dips.
 - **Exit:** sell as soon as the bid is `--take` % (default 5) above entry. `--stop` adds an
   optional stop-loss. Positions still open at expiry settle at 1 or 0.
 - **Risk:** `--usd` per trade (default 20), `--max-open` positions (default 3), no new
@@ -182,7 +186,10 @@ mark/oracle at expiry, not a candle close.
 - **Modes:** paper by default, with simulated fills against the live order book. `--live`
   sends real IOC orders through the configured signer (agent key preferred).
   Positions persist to `bot-state-paper.json` / `bot-state-live.json`, so a restart resumes.
-  Every buy, sell and an hourly summary go to the Telegram channel.
+  Every buy, sell and an hourly summary go to the Telegram channel. Each tick's token
+  prices, oracle spots and gate values are appended to `bot-ticks.jsonl` (`--no-record`
+  to disable), so strategy changes can later be replayed on real token prices; Hyperliquid
+  doesn't serve candles for expired outcome tokens.
 
 ```sh
 hip4 bot                                    # paper, markets from WATCH_WHITELIST
@@ -190,7 +197,7 @@ hip4 bot "(1d)" --usd 25 --stop 15          # all daily binaries, with a stop
 hip4 bot 11382 --live --usd 20              # real orders
 ```
 
-The model gate uses `--source oracle` by default: candles rebuilt as Hyperliquid's oracle
+Volatility and the Kronos gate use `--source oracle` by default: candles rebuilt as Hyperliquid's oracle
 does it, as the weighted median of Binance (3), OKX (2), Bybit (2), Kraken, KuCoin, Gate
 and MEXC (1 each) per bar. It tracks the venue's own oracle price within about 0.001%.
 

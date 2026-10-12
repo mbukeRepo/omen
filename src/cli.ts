@@ -548,9 +548,12 @@ program
   .option("--model <m>", "mini | small | base", "mini")
   .option("--source <s>", "oracle | binance | okx | bybit | kraken | kucoin | gate | mexc | coinbase | hl", "binance")
   .option("--offsets <list>", "strike offsets vs spot, %", "-1,-0.5,0,0.5,1")
-  .action(async (underlying: string, opts: { trials: string; paths: string; model: string; source: string; offsets: string }) => {
+  .option("--method <m>", "kronos | digital (vol-based fair value) | both", "kronos")
+  .option("--vol-bars <n>", "realized-vol window for the digital model, in 4h bars", "42")
+  .action(async (underlying: string, opts: { trials: string; paths: string; model: string; source: string; offsets: string; method: string; volBars: string }) => {
     const variant = KRONOS_MODELS[opts.model];
     if (!variant) throw new Error(`--model must be mini, small or base, got "${opts.model}"`);
+    if (!["kronos", "digital", "both"].includes(opts.method)) throw new Error(`--method must be kronos, digital or both`);
     const nTrials = Number(opts.trials);
     const offsets = opts.offsets.split(",").map((s) => Number(s) / 100);
     const interval = "4h";
@@ -578,8 +581,23 @@ program
     }
     trials.reverse();
     if (trials.length < 10) throw new Error(`only ${trials.length} usable trials — not enough history from ${opts.source}`);
-    console.log(`${trials.length} trials, running (model load + ${trials.length * Number(opts.paths)} sampled paths)…`);
 
+    const { printScore, scoreProbabilities } = await import("./scoring.js");
+    if (opts.method !== "kronos") {
+      const { digitalProb, realizedVol } = await import("./fairvalue.js");
+      const volBars = Number(opts.volBars);
+      const rows = trials.flatMap((tr) => {
+        const closes = candles.slice(Math.max(0, tr.end - volBars - 1), tr.end).map((c) => Number(c.c));
+        const sigma = realizedVol(closes);
+        const spot = Number(candles[tr.end - 1]!.c);
+        const settle = Number(candles[tr.outcome]!.c);
+        return tr.strikes.map((k) => ({ prob: digitalProb(spot, k, sigma, predLen), y: settle >= k ? 1 : 0 }));
+      });
+      printScore(scoreProbabilities(rows), `digital fair value (${volBars}-bar realized vol), ${trials.length} days`);
+      if (opts.method === "digital") return;
+    }
+
+    console.log(`${trials.length} trials, running (model load + ${trials.length * Number(opts.paths)} sampled paths)…`);
     const { spawnSync } = await import("node:child_process");
     const kronosDir = new URL("../kronos", import.meta.url).pathname;
     const res = spawnSync(`${kronosDir}/venv/bin/python`, [`${kronosDir}/backtest.py`], {
@@ -603,22 +621,9 @@ program
     const out = JSON.parse(res.stdout.trim().split("\n").pop()!) as {
       device: string;
       trials: number;
-      predictions: number;
-      brier: number;
-      brierAlways50: number;
-      brierClimatology: number;
-      accuracy: number;
-      baseRate: number;
-      calibration: { bucket: string; n: number; meanProb: number; freq: number }[];
+      results: { prob: number; y: number }[];
     };
-
-    console.log(`\n${out.predictions} predictions over ${out.trials} days (${out.device})`);
-    console.log(`Brier score:        ${out.brier.toFixed(4)}  (lower is better)`);
-    console.log(`  always-50% ref:   ${out.brierAlways50.toFixed(4)}`);
-    console.log(`  climatology ref:  ${out.brierClimatology.toFixed(4)}  (base rate ${out.baseRate.toFixed(3)})`);
-    console.log(`Accuracy @0.5:      ${(out.accuracy * 100).toFixed(1)}%`);
-    console.log(`\nCalibration (model says → actually happens):`);
-    console.table(out.calibration.map((b) => ({ "model says": b.bucket, n: b.n, "mean prob": b.meanProb.toFixed(3), "actual freq": b.freq.toFixed(3) })));
+    printScore(scoreProbabilities(out.results), `Kronos-${opts.model} (${out.device}), ${out.trials} days`);
   });
 
 program
@@ -730,7 +735,9 @@ program
   .option("--max-loss <usd>", "stop opening trades after this realized loss (default 3x --usd)")
   .option("--min-hours <h>", "no new entries this close to expiry", "2")
   .option("--edge <pp>", "model must exceed the ask by this many probability points", "0")
-  .option("--no-model", "trade dips without the Kronos gate")
+  .option("--gate <g>", "fair (live digital fair value) | kronos | none", "fair")
+  .option("--record <file>", "append every tick's token prices, spots and gate values (JSONL)", "bot-ticks.jsonl")
+  .option("--no-record", "don't record ticks")
   .option("--kronos <m>", "Kronos variant for the gate: mini | small | base", "small")
   .option("--source <s>", "candle source for the gate (oracle = Hyperliquid's oracle-weighted venue median)", "oracle")
   .option("--live", "send real orders (default: paper fills against the live order book)")
@@ -740,7 +747,7 @@ program
       markets: string[],
       opts: {
         dip: string; take: string; stop?: string; window: string; tick: string; modelRefresh: string; usd: string;
-        maxOpen: string; maxLoss?: string; minHours: string; edge: string; model: boolean; kronos: string;
+        maxOpen: string; maxLoss?: string; minHours: string; edge: string; gate: string; record: string | false; kronos: string;
         source: string; live?: boolean; state?: string;
       },
     ) => {
@@ -754,6 +761,7 @@ program
       const usd = num(opts.usd, "usd");
       if (opts.live && usd < 10) throw new Error("--usd must be at least 10 in live mode (Hyperliquid minimum order value)");
       if (!KRONOS_MODELS[opts.kronos]) throw new Error(`--kronos must be mini, small or base, got "${opts.kronos}"`);
+      if (!["fair", "kronos", "none"].includes(opts.gate)) throw new Error(`--gate must be fair, kronos or none, got "${opts.gate}"`);
 
       const entries = markets.length > 0 ? markets : cfg.watchWhitelist;
       const { indices, slugs, patterns } = classifyWatchEntries(entries);
@@ -781,9 +789,10 @@ program
           maxOpen: num(opts.maxOpen, "max-open"),
           maxLossUsd: opts.maxLoss !== undefined ? num(opts.maxLoss, "max-loss") : usd * 3,
           minHoursToExpiry: Number(opts.minHours),
-          useModel: opts.model,
+          gate: opts.gate as "fair" | "kronos" | "none",
           minEdge: Number(opts.edge) / 100,
           statePath: opts.state ?? `bot-state-${opts.live ? "live" : "paper"}.json`,
+          recordPath: opts.record === false ? null : opts.record,
           indices,
           slugs,
           patterns,
@@ -792,6 +801,16 @@ program
           info,
           executor,
           forecast: (fields) => kronosForecast(info, fields, fopts).then((r) => r.probAbove),
+          // Hourly realized vol over the last 7 days of 1h candles from the gate's source.
+          vol: async (underlying) => {
+            const { fetchCandles } = await import("./candles.js");
+            const { realizedVol } = await import("./fairvalue.js");
+            const now = Date.now();
+            const candles = await fetchCandles(opts.source, info, underlying, "1h", now - 170 * 3_600_000, now);
+            const closes = candles.slice(0, -1).map((c) => Number(c.c));
+            if (closes.length < 48) throw new Error(`only ${closes.length} 1h candles for ${underlying}`);
+            return realizedVol(closes);
+          },
           notify: (text) => {
             console.log(`\n${text}`);
             tg?.send(text);

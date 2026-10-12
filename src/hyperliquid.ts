@@ -233,6 +233,19 @@ export class HyperliquidInfo {
     });
   }
 
+  /** Live oracle price per perp asset name (validators' weighted venue median, updated ~3s). */
+  async oraclePrices(): Promise<Record<string, number>> {
+    const [meta, ctxs] = await this.info<[{ universe: { name: string }[] }, { oraclePx: string }[]]>({
+      type: "metaAndAssetCtxs",
+    });
+    const out: Record<string, number> = {};
+    meta.universe.forEach((u, i) => {
+      const px = Number(ctxs[i]?.oraclePx);
+      if (Number.isFinite(px)) out[u.name.toUpperCase()] = px;
+    });
+    return out;
+  }
+
   /** Perps account value in USDC (deposits land here before `move`ing to spot). */
   async perpAccountValue(user: string): Promise<string> {
     const res = await this.info<{ marginSummary?: { accountValue?: string } }>({

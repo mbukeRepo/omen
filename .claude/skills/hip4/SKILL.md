@@ -114,7 +114,8 @@ hip4 bot "(1d)" --dip 5 --take 5 --usd 20 --stop 15
 ```
 
 Buys a YES/NO token that trades `--dip`% below its rolling `--window`-minute high when
-Kronos values it at or above the ask; sells when the bid is `--take`% above entry. Paper
+the gate values it at or above the ask (default `--gate fair`: live digital-option fair
+value from oracle spot, strike, time left and realized vol); sells when the bid is `--take`% above entry. Paper
 mode is safe to start on your own. **`--live` sends real orders: never add it unless the
 user explicitly asked for live trading in this conversation.** State lives in
 `bot-state-<mode>.json`; trades and an hourly summary go to Telegram. It's a long-running
