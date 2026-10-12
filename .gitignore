@@ -5,3 +5,4 @@ dist/
 .tmp/
 kronos/venv/
 kronos/vendor/
+__pycache__/
