@@ -9,6 +9,28 @@ export interface RecordedTick {
   spot: Record<string, number>;
 }
 
+/**
+ * Carry each token's last values across ticks where it wasn't recorded, as
+ * long as it shows up again later: a recording gap is not a resolution. After
+ * a token's final appearance it stays absent, so real resolutions replay.
+ */
+export function fillGaps(ticks: RecordedTick[]): RecordedTick[] {
+  const lastSeen = new Map<string, number>();
+  for (const t of ticks) for (const coin of Object.keys(t.tokens)) lastSeen.set(coin, t.t);
+  const prev: RecordedTick["tokens"] = {};
+  let prevSpot: Record<string, number> = {};
+  return ticks.map((t) => {
+    const tokens = { ...t.tokens };
+    for (const [coin, v] of Object.entries(prev)) {
+      if (tokens[coin] === undefined && lastSeen.get(coin)! > t.t) tokens[coin] = v;
+    }
+    Object.assign(prev, tokens);
+    const spot = { ...prevSpot, ...t.spot };
+    prevSpot = spot;
+    return { t: t.t, tokens, spot };
+  });
+}
+
 export type SimOptions = Omit<BotOptions, "recordTicks" | "indices" | "slugs" | "patterns" | "gate"> & {
   gate: "fair" | "none";
 };

@@ -421,6 +421,13 @@ export class Bot {
     for (const pos of [...this.state.positions]) {
       const coin = encodeCoin(pos.outcome, pos.side);
       if (mids[coin] === undefined) {
+        // A price binary can't resolve before its expiry; a missing quote before
+        // then is a data gap, not a settlement.
+        const m = this.markets.get(pos.outcome);
+        if (m?.fields && this.now() < m.fields.expiryMs) {
+          this.skip(coin, "no quote this tick (data gap before expiry) — holding");
+          continue;
+        }
         // Market stopped quoting: it resolved. Tokens settle at 1 or 0.
         const settle = (this.lastMid.get(coin) ?? pos.entryPx) >= 0.5 ? 1 : 0;
         await this.close(pos, settle, "resolved");

@@ -164,8 +164,11 @@ test("open positions settle at 1/0 when the market resolves", async () => {
   h2.setYes(0.98);
   h2.advance(1);
   await h2.bot.tick(); // last mid 0.98
-  h2.setYes(null); // market stops quoting
+  h2.setYes(null); // quote missing before expiry: a data gap, keep holding
   h2.advance(1);
+  await h2.bot.tick();
+  assert.equal(h2.bot.state.positions.length, 1, "no settlement before expiry");
+  h2.advance(24 * 60); // past the 06:00 expiry, still no quote: resolved
   await h2.bot.tick();
   const t = h2.bot.state.closed[0]!;
   assert.equal(t.reason, "resolved");

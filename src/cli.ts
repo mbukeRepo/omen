@@ -965,7 +965,7 @@ program
       const pg = await PgStore.connect(cfg.databaseUrl);
       try {
         const tok = await pg.query<{ ts: Date; coin: string; mid: number; bid: number | null; ask: number | null }>(
-          "SELECT ts, coin, mid, bid, ask FROM token_ticks WHERE ts >= to_timestamp($1 / 1000.0) AND ts <= to_timestamp($2 / 1000.0) AND bid IS NOT NULL ORDER BY ts",
+          "SELECT ts, coin, mid, bid, ask FROM token_ticks WHERE ts >= to_timestamp($1 / 1000.0) AND ts <= to_timestamp($2 / 1000.0) ORDER BY ts",
           [from, to],
         );
         const spots = await pg.query<{ ts: Date; underlying: string; px: number }>(
@@ -983,8 +983,11 @@ program
           const row = byT.get(r.ts.getTime());
           if (row) row.spot[r.underlying] = r.px;
         }
-        const ticks = [...byT.values()].sort((a, b) => a.t - b.t);
-        if (ticks.length < 10) throw new Error(`only ${ticks.length} recorded ticks with order-book data in that window`);
+        const { fillGaps } = await import("./sim.js");
+        const ticks = fillGaps([...byT.values()].sort((a, b) => a.t - b.t));
+        if (ticks.length < 10) throw new Error(`only ${ticks.length} recorded ticks in that window`);
+        const withBook = ticks.filter((t) => Object.values(t.tokens).some((v) => v.bid !== null)).length;
+        if (withBook === 0) throw new Error("no ticks in that window carry bid/ask (recorded before top-of-book recording existed)");
 
         const outcomes = [...new Set(ticks.flatMap((t) => Object.keys(t.tokens).map((c) => Math.floor(Number(c.slice(1)) / 10))))];
         const markets = (

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { replay, type RecordedTick, type SimOptions } from "../src/sim.js";
+import { fillGaps, replay, type RecordedTick, type SimOptions } from "../src/sim.js";
 
 const T0 = Date.UTC(2026, 9, 12, 7, 0);
 const markets = [
@@ -62,4 +62,16 @@ test("replays are deterministic", async () => {
   const b = await replay(ticks, markets, opts, { ETH: 0.005 });
   assert.equal(a.realized, b.realized);
   assert.equal(a.trades, b.trades);
+});
+
+test("fillGaps bridges recording gaps but keeps a token's final disappearance", () => {
+  const tok = (mid: number) => ({ mid, bid: mid - 0.005, ask: mid + 0.005 });
+  const filled = fillGaps([
+    { t: 1, tokens: { "#70": tok(0.5), "#80": tok(0.9) }, spot: { ETH: 1 } },
+    { t: 2, tokens: { "#80": tok(0.91) }, spot: {} }, // #70 missing mid-window
+    { t: 3, tokens: { "#70": tok(0.52) }, spot: { ETH: 2 } }, // #80 gone for good
+  ]);
+  assert.equal(filled[1]!.tokens["#70"]!.mid, 0.5, "gap filled from the previous tick");
+  assert.equal(filled[1]!.spot.ETH, 1, "spot carried forward");
+  assert.equal(filled[2]!.tokens["#80"], undefined, "final disappearance kept");
 });
