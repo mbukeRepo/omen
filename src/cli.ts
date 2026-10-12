@@ -722,7 +722,7 @@ program
 
 program
   .command("bot")
-  .description("Real-time bot: buy outcome tokens that dip from their rolling high (Kronos-gated), sell on +take%. Paper by default")
+  .description("Real-time bot: buy outcome tokens that dip below their rolling high when the gate values them above the ask, sell on +take%. Paper by default")
   .argument("[markets...]", "outcome indices, trade URLs or name patterns (falls back to WATCH_WHITELIST)")
   .option("--dip <pct>", "buy when a token trades this % below its rolling high", "5")
   .option("--take <pct>", "sell when the bid reaches this % above entry", "5")
