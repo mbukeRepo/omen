@@ -1,20 +1,36 @@
 {
-  "name": "hip4-cli",
+  "name": "@mbukerepo/hip4-cli",
   "version": "0.1.0",
-  "private": true,
-  "description": "CLI for Hyperliquid HIP-4 outcome markets, signing with a Turnkey wallet",
+  "description": "CLI for Hyperliquid HIP-4 outcome markets: trading, Telegram watching, and Kronos forecasts, signing with Turnkey or local wallets",
   "type": "module",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mbukeRepo/omen.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.6"
   },
   "bin": {
     "hip4": "dist/cli.js"
   },
+  "files": [
+    "dist",
+    "kronos/forecast.py",
+    "kronos/backtest.py",
+    "kronos/setup.sh",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "hip4": "tsx src/cli.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@nktkas/hyperliquid": "^0.33.3",

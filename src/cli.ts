@@ -52,7 +52,8 @@ async function signerAddress(): Promise<string> {
 /** Append env vars to .env, refusing to overwrite existing non-empty values. */
 async function saveEnv(pairs: Record<string, string>): Promise<void> {
   const { readFile, writeFile } = await import("node:fs/promises");
-  const envPath = new URL("../.env", import.meta.url).pathname;
+  // dotenv/config loads .env from the working directory, so save it there too.
+  const envPath = `${process.cwd()}/.env`;
   const existing = await readFile(envPath, "utf8").catch(() => "");
   for (const key of Object.keys(pairs)) {
     if (new RegExp(`^\\s*${key}\\s*=\\s*\\S`, "m").test(existing)) {

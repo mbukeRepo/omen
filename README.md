@@ -5,11 +5,36 @@ CLI for trading [Hyperliquid HIP-4 outcome markets](https://hyperliquid.gitbook.
 viem account, so every trade is a Turnkey signing activity governed by your org's policies —
 no raw private key on the machine running the CLI.
 
-## Setup
+## Install
+
+From GitHub Packages (needs a GitHub token with `read:packages`):
+
+```sh
+echo "@mbukerepo:registry=https://npm.pkg.github.com" >> ~/.npmrc
+echo "//npm.pkg.github.com/:_authToken=<GITHUB_TOKEN>" >> ~/.npmrc
+npm install -g @mbukerepo/hip4-cli
+hip4 --help
+```
+
+The installed CLI reads `.env` from the directory you run it in (see the variables below).
+For `forecast`/`backtest`, run the bundled `kronos/setup.sh` once from the package directory
+(`$(npm root -g)/@mbukerepo/hip4-cli`).
+
+## Development
 
 ```sh
 npm install
-cp .env.example .env   # fill in Turnkey credentials
+cp .env.example .env   # fill in credentials
+npm run typecheck && npm test
+```
+
+CI (`.github/workflows/ci.yml`) runs typecheck, tests, build, a CLI smoke test, and a package
+dry-run on Node 20 and 22, plus a compile check of the Python Kronos sidecar. To release,
+bump the version and push the tag. `release.yml` checks that the tag matches `package.json`,
+reruns the tests, publishes to GitHub Packages, and creates a GitHub Release:
+
+```sh
+npm version patch && git push --follow-tags
 ```
 
 | Variable | Meaning |
