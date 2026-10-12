@@ -218,6 +218,7 @@ export class Bot {
       if (this.opts.patterns.some((p) => hay.includes(p))) wanted.add(o.outcome);
     }
     for (const p of this.state.positions) wanted.add(p.outcome);
+    const added: { outcome: number; name: string; description: string }[] = [];
     for (const outcome of wanted) {
       if (this.markets.has(outcome)) continue;
       const o = meta.outcomes.find((x) => x.outcome === outcome);
@@ -228,7 +229,9 @@ export class Bot {
         continue;
       }
       this.markets.set(outcome, { outcome, label: describeOutcome(o, meta.questions), url: marketUrl(o), fields });
+      added.push({ outcome, name: o.name, description: o.description });
     }
+    if (added.length) await this.persist("market metadata", () => this.deps.store.saveMarkets(added));
     for (const [outcome, m] of this.markets) {
       const expired = m.fields !== null && m.fields.expiryMs < this.now();
       if (expired && !this.state.positions.some((p) => p.outcome === outcome)) {
@@ -396,8 +399,19 @@ export class Bot {
         spot[m.fields.underlying] = this.spots[m.fields.underlying.toUpperCase()]!;
       }
     }
+    const books: Record<string, { bid: number | null; ask: number | null }> = {};
+    await Promise.all(
+      Object.keys(tokens).map(async (coin) => {
+        try {
+          const b = await this.deps.info.l2Book(coin);
+          books[coin] = { bid: b.bids[0]?.px ?? null, ask: b.asks[0]?.px ?? null };
+        } catch {
+          // A missing book just leaves bid/ask null for this tick.
+        }
+      }),
+    );
     try {
-      await this.deps.store.recordTick({ t: this.now(), tokens, spot, gate, gateKind: this.opts.gate });
+      await this.deps.store.recordTick({ t: this.now(), tokens, spot, gate, gateKind: this.opts.gate, books });
     } catch (err) {
       this.skip("record", `tick recording failed: ${String(err).slice(0, 100)}`);
     }

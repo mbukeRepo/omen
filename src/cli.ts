@@ -844,13 +844,19 @@ program
   .description("Bot performance from its store: open positions, closed trades, PnL by exit reason")
   .option("--live", "report the live bot (default: paper)")
   .option("--state <file>", "file store to read when DATABASE_URL is unset")
-  .action(async (opts: { live?: boolean; state?: string }) => {
+  .option("--since <t>", "only positions opened since: 5h / 90m / ISO time")
+  .action(async (opts: { live?: boolean; state?: string; since?: string }) => {
     const { openStore, PgStore } = await import("./store.js");
     const mode = opts.live ? "live" : "paper";
     const store = await openStore(cfg.databaseUrl, { statePath: opts.state ?? `bot-state-${mode}.json`, ticksPath: null });
     try {
       const s = await store.load(mode);
-      console.log(`${mode} bot — ${store.description}`);
+      if (opts.since) {
+        const since = parseSince(opts.since);
+        s.positions = s.positions.filter((p) => p.openedAt >= since);
+        s.closed = s.closed.filter((t) => t.openedAt >= since);
+      }
+      console.log(`${mode} bot — ${store.description}${opts.since ? ` — positions opened since ${opts.since}` : ""}`);
       const mids = await info.allMids();
       if (s.positions.length) {
         console.log("\nopen positions:");
@@ -909,6 +915,126 @@ program
       await store.end();
     }
   });
+
+/** "5h", "90m", "2d" ago, or an ISO timestamp. */
+function parseSince(v: string): number {
+  const rel = v.match(/^(\d+(?:\.\d+)?)([mhd])$/);
+  if (rel) return Date.now() - Number(rel[1]) * { m: 60_000, h: 3_600_000, d: 86_400_000 }[rel[2] as "m" | "h" | "d"];
+  const t = Date.parse(v);
+  if (!Number.isFinite(t)) throw new Error(`can't parse time "${v}" (use e.g. 5h, 90m or an ISO timestamp)`);
+  return t;
+}
+
+program
+  .command("sim")
+  .description("Replay recorded ticks from Postgres through the bot's logic for a grid of strategy variants")
+  .option("--since <t>", "window start: 5h / 90m / ISO time", "5h")
+  .option("--until <t>", "window end (default now)")
+  .option("--gates <list>", "gates to compare", "fair,none")
+  .option("--dips <list>", "dip thresholds % to compare", "3,5,8")
+  .option("--takes <list>", "take-profit % to compare", "3,5,8")
+  .option("--stop <pct>", "stop-loss % (default none)")
+  .option("--window <mins>", "rolling-high window", "60")
+  .option("--usd <n>", "USDC per trade", "20")
+  .option("--source <s>", "candle source for the fair gate's vol", "oracle")
+  .action(
+    async (opts: {
+      since: string; until?: string; gates: string; dips: string; takes: string; stop?: string; window: string; usd: string; source: string;
+    }) => {
+      if (!cfg.databaseUrl) throw new Error("sim reads recorded ticks from Postgres: set DATABASE_URL");
+      const { PgStore } = await import("./store.js");
+      const { replay } = await import("./sim.js");
+      const { fetchCandles } = await import("./candles.js");
+      const { realizedVol } = await import("./fairvalue.js");
+      const from = parseSince(opts.since);
+      const to = opts.until ? parseSince(opts.until) : Date.now();
+      const list = (v: string) => v.split(",").map((s) => s.trim()).filter(Boolean);
+
+      const pg = await PgStore.connect(cfg.databaseUrl);
+      try {
+        const tok = await pg.query<{ ts: Date; coin: string; mid: number; bid: number | null; ask: number | null }>(
+          "SELECT ts, coin, mid, bid, ask FROM token_ticks WHERE ts >= to_timestamp($1 / 1000.0) AND ts <= to_timestamp($2 / 1000.0) AND bid IS NOT NULL ORDER BY ts",
+          [from, to],
+        );
+        const spots = await pg.query<{ ts: Date; underlying: string; px: number }>(
+          "SELECT ts, underlying, px FROM spot_ticks WHERE ts >= to_timestamp($1 / 1000.0) AND ts <= to_timestamp($2 / 1000.0)",
+          [from, to],
+        );
+        const byT = new Map<number, { t: number; tokens: Record<string, { mid: number; bid: number | null; ask: number | null }>; spot: Record<string, number> }>();
+        for (const r of tok.rows) {
+          const t = r.ts.getTime();
+          const row = byT.get(t) ?? { t, tokens: {}, spot: {} };
+          row.tokens[r.coin] = { mid: r.mid, bid: r.bid, ask: r.ask };
+          byT.set(t, row);
+        }
+        for (const r of spots.rows) {
+          const row = byT.get(r.ts.getTime());
+          if (row) row.spot[r.underlying] = r.px;
+        }
+        const ticks = [...byT.values()].sort((a, b) => a.t - b.t);
+        if (ticks.length < 10) throw new Error(`only ${ticks.length} recorded ticks with order-book data in that window`);
+
+        const outcomes = [...new Set(ticks.flatMap((t) => Object.keys(t.tokens).map((c) => Math.floor(Number(c.slice(1)) / 10))))];
+        const markets = (
+          await pg.query<{ outcome: number; name: string; description: string }>(
+            "SELECT outcome, name, description FROM markets WHERE outcome = ANY($1::int[])",
+            [outcomes],
+          )
+        ).rows;
+        const missing = outcomes.filter((o) => !markets.some((m) => m.outcome === o));
+        if (missing.length) console.warn(`no stored metadata for #${missing.join(", #")} — those markets are skipped`);
+
+        const underlyings = [...new Set(markets.flatMap((m) => {
+          const f = priceBinaryFields({ ...m, sideSpecs: [] });
+          return f ? [f.underlying] : [];
+        }))];
+        const vols: Record<string, number> = {};
+        for (const u of underlyings) {
+          const c = await fetchCandles(opts.source, info, u, "1h", from - 170 * 3_600_000, from);
+          vols[u] = realizedVol(c.map((x) => Number(x.c)));
+        }
+
+        const hours = (ticks.at(-1)!.t - ticks[0]!.t) / 3_600_000;
+        console.log(
+          `replaying ${ticks.length} ticks over ${hours.toFixed(1)}h (${new Date(ticks[0]!.t).toISOString().slice(0, 16)} → ${new Date(ticks.at(-1)!.t).toISOString().slice(0, 16)}), ` +
+            `${markets.length} markets, vol ${Object.entries(vols).map(([u, v]) => `${u} ${(v * 100).toFixed(3)}%/h`).join(", ")}`,
+        );
+
+        const rows = [];
+        for (const gate of list(opts.gates)) {
+          if (gate !== "fair" && gate !== "none") throw new Error(`sim gates: fair | none, got "${gate}"`);
+          for (const dip of list(opts.dips).map(Number)) {
+            for (const take of list(opts.takes).map(Number)) {
+              const r = await replay(
+                ticks,
+                markets,
+                {
+                  dipPct: dip, takePct: take, stopPct: opts.stop ? Number(opts.stop) : null, windowMins: Number(opts.window),
+                  tickSecs: 5, modelRefreshMins: 60, usdPerTrade: Number(opts.usd), maxOpen: 3, maxLossUsd: Number(opts.usd) * 3,
+                  minHoursToExpiry: 2, gate, minEdge: 0,
+                },
+                vols,
+              );
+              rows.push({
+                gate, dip, take,
+                buys: r.trades + r.state.positions.length,
+                closed: r.trades,
+                wins: r.wins,
+                realized: r.realized,
+                "open@bid": r.unrealized,
+                total: r.realized + r.unrealized,
+              });
+            }
+          }
+        }
+        rows.sort((a, b) => b.total - a.total);
+        console.table(rows.map((r) => ({ ...r, realized: r.realized.toFixed(2), "open@bid": r["open@bid"].toFixed(2), total: r.total.toFixed(2) })));
+        console.log("PnL in USDC per variant; open positions marked at the last bid. Fills at recorded top of book, size unlimited.");
+      } finally {
+        await pg.end();
+      }
+    },
+  );
 
 const db = program.command("db").description("Postgres storage for the bot (DATABASE_URL)");
 db.command("migrate")

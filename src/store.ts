@@ -37,6 +37,8 @@ export interface TickRow {
   /** Gate P(YES) by outcome index. */
   gate: Record<string, number>;
   gateKind: string;
+  /** Best bid/ask by book coin, when the recorder fetched books (needed for replays). */
+  books?: Record<string, { bid: number | null; ask: number | null }>;
 }
 
 /**
@@ -50,7 +52,15 @@ export interface BotStore {
   savePosition(mode: Mode, pos: OpenPosition): Promise<void>;
   saveTrade(mode: Mode, trade: ClosedTrade): Promise<void>;
   recordTick(row: TickRow): Promise<void>;
+  /** Remember market metadata: Hyperliquid prunes expired outcomes, replays still need it. */
+  saveMarkets(outcomes: MarketMeta[]): Promise<void>;
   end(): Promise<void>;
+}
+
+export interface MarketMeta {
+  outcome: number;
+  name: string;
+  description: string;
 }
 
 // ---------- files (fallback when no DATABASE_URL) ----------
@@ -103,9 +113,35 @@ export class FileStore implements BotStore {
 
   async recordTick(row: TickRow): Promise<void> {
     if (!this.ticksPath) return;
-    appendFileSync(this.ticksPath, `${JSON.stringify({ t: row.t, tokens: row.tokens, spot: row.spot, gate: row.gate })}\n`);
+    const { gateKind: _, ...rest } = row;
+    appendFileSync(this.ticksPath, `${JSON.stringify(rest)}\n`);
   }
 
+  async saveMarkets(): Promise<void> {}
+  async end(): Promise<void> {}
+}
+
+/** In-memory store for replays and tests. */
+export class MemoryStore implements BotStore {
+  readonly description = "memory";
+  readonly positions = new Map<string, OpenPosition>();
+  readonly trades = new Map<string, ClosedTrade>();
+
+  async load(mode: Mode): Promise<BotState> {
+    return { mode, positions: [...this.positions.values()], closed: [...this.trades.values()] };
+  }
+
+  async savePosition(_mode: Mode, pos: OpenPosition): Promise<void> {
+    this.positions.set(pos.id, { ...pos });
+  }
+
+  async saveTrade(_mode: Mode, trade: ClosedTrade): Promise<void> {
+    this.positions.delete(trade.id);
+    this.trades.set(trade.id, { ...trade });
+  }
+
+  async recordTick(): Promise<void> {}
+  async saveMarkets(): Promise<void> {}
   async end(): Promise<void> {}
 }
 
@@ -136,6 +172,8 @@ CREATE TABLE IF NOT EXISTS token_ticks (
   mid   double precision NOT NULL
 );
 CREATE INDEX IF NOT EXISTS token_ticks_coin_ts ON token_ticks (coin, ts);
+ALTER TABLE token_ticks ADD COLUMN IF NOT EXISTS bid double precision;
+ALTER TABLE token_ticks ADD COLUMN IF NOT EXISTS ask double precision;
 
 CREATE TABLE IF NOT EXISTS spot_ticks (
   ts          timestamptz NOT NULL,
@@ -151,6 +189,13 @@ CREATE TABLE IF NOT EXISTS gate_ticks (
   p_yes    double precision NOT NULL
 );
 CREATE INDEX IF NOT EXISTS gate_ticks_outcome_ts ON gate_ticks (outcome, ts);
+
+CREATE TABLE IF NOT EXISTS markets (
+  outcome      integer PRIMARY KEY,
+  name         text NOT NULL,
+  description  text NOT NULL,
+  first_seen   timestamptz NOT NULL DEFAULT now()
+);
 `;
 
 type Pool = import("pg").Pool;
@@ -242,8 +287,15 @@ export class PgStore implements BotStore {
     await Promise.all([
       coins.length &&
         this.pool.query(
-          "INSERT INTO token_ticks (ts, coin, mid) SELECT to_timestamp($1 / 1000.0), unnest($2::text[]), unnest($3::float8[])",
-          [ts, coins, coins.map((c) => row.tokens[c])],
+          `INSERT INTO token_ticks (ts, coin, mid, bid, ask)
+           SELECT to_timestamp($1 / 1000.0), unnest($2::text[]), unnest($3::float8[]), unnest($4::float8[]), unnest($5::float8[])`,
+          [
+            ts,
+            coins,
+            coins.map((c) => row.tokens[c]),
+            coins.map((c) => row.books?.[c]?.bid ?? null),
+            coins.map((c) => row.books?.[c]?.ask ?? null),
+          ],
         ),
       unders.length &&
         this.pool.query(
@@ -256,6 +308,16 @@ export class PgStore implements BotStore {
           [ts, outs.map(Number), row.gateKind, outs.map((o) => row.gate[o])],
         ),
     ]);
+  }
+
+  async saveMarkets(outcomes: MarketMeta[]): Promise<void> {
+    if (outcomes.length === 0) return;
+    await this.pool.query(
+      `INSERT INTO markets (outcome, name, description)
+       SELECT unnest($1::int[]), unnest($2::text[]), unnest($3::text[])
+       ON CONFLICT (outcome) DO NOTHING`,
+      [outcomes.map((o) => o.outcome), outcomes.map((o) => o.name), outcomes.map((o) => o.description)],
+    );
   }
 
   /** Raw access for reports and imports. */

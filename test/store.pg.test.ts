@@ -80,9 +80,15 @@ test("ticks land in the token, spot and gate tables", { skip }, async () => {
     spot: { BTC: 84182 },
     gate: { "11382": 0.5558 },
     gateKind: "fair",
+    books: { "#113820": { bid: 0.54, ask: 0.55 } },
   });
-  const tokens = await store.query<{ coin: string; mid: number; ts: Date }>("SELECT coin, mid, ts FROM token_ticks ORDER BY coin");
-  assert.deepEqual(tokens.rows.map((r) => [r.coin, r.mid]), [["#113820", 0.54686], ["#113821", 0.45314]]);
+  const tokens = await store.query<{ coin: string; mid: number; bid: number | null; ask: number | null; ts: Date }>(
+    "SELECT coin, mid, bid, ask, ts FROM token_ticks ORDER BY coin",
+  );
+  assert.deepEqual(tokens.rows.map((r) => [r.coin, r.mid, r.bid, r.ask]), [
+    ["#113820", 0.54686, 0.54, 0.55],
+    ["#113821", 0.45314, null, null],
+  ]);
   assert.equal(tokens.rows[0]!.ts.getTime(), t);
   const spot = await store.query<{ underlying: string; px: number }>("SELECT underlying, px FROM spot_ticks");
   assert.deepEqual(spot.rows, [{ underlying: "BTC", px: 84182 }]);
@@ -95,4 +101,12 @@ test("connecting twice is safe (schema creation is idempotent)", { skip }, async
   url.searchParams.set("options", `-c search_path=${schema}`);
   const again = await PgStore.connect(url.toString());
   await again.end();
+});
+
+test("market metadata is kept once per outcome", { skip }, async () => {
+  const m = { outcome: 11382, name: "x", description: "class:priceBinary|underlying:BTC|targetPrice:83988|expiry:20261013-0600|period:1d" };
+  await store.saveMarkets([m]);
+  await store.saveMarkets([{ ...m, description: "changed" }]);
+  const { rows } = await store.query<{ description: string }>("SELECT description FROM markets WHERE outcome = 11382");
+  assert.deepEqual(rows, [{ description: m.description }]);
 });
