@@ -32,6 +32,8 @@ export interface Config {
   telegram: { token: string; chatId: string } | null;
   /** Default watchlist for `watch`: outcome indices and/or name patterns. */
   watchWhitelist: string[];
+  /** Postgres for bot state, trades and tick history; null = JSON files. */
+  databaseUrl: string | null;
 }
 
 export function loadConfig(): Config {
@@ -83,6 +85,7 @@ export function loadConfig(): Config {
       accountIndex: Number(process.env.WALLET_ACCOUNT_INDEX ?? "0"),
     },
     telegram: tgToken !== "" && tgChatId !== "" ? { token: tgToken, chatId: tgChatId } : null,
+    databaseUrl: process.env.DATABASE_URL?.trim() || null,
     watchWhitelist: (process.env.WATCH_WHITELIST ?? "")
       .split(",")
       .map((s) => s.trim())

@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Bot, paperExecutor, type BotOptions } from "../src/bot.js";
+import { FileStore } from "../src/store.js";
 import type { Book, OutcomeMeta } from "../src/hyperliquid.js";
 
 const T0 = Date.UTC(2026, 9, 12, 6, 0);
@@ -20,7 +21,7 @@ const meta: OutcomeMeta = {
 };
 
 /** A market whose YES token trades at `mid` with a 1-tick spread; NO mirrors it. */
-function harness(over: Partial<BotOptions> = {}) {
+async function harness(over: Partial<BotOptions> = {}) {
   let now = T0;
   let yes: number | null = 0.5;
   let spot = 2564.1;
@@ -30,7 +31,8 @@ function harness(over: Partial<BotOptions> = {}) {
     asks: [{ px: mid + 0.005, sz: 1000 }],
     ts: now,
   });
-  const bot = new Bot(
+  const statePath = join(mkdtempSync(join(tmpdir(), "hip4-bot-")), "state.json");
+  const bot = await Bot.create(
     {
       dipPct: 5,
       takePct: 5,
@@ -44,8 +46,7 @@ function harness(over: Partial<BotOptions> = {}) {
       minHoursToExpiry: 2,
       gate: "kronos",
       minEdge: 0,
-      statePath: join(mkdtempSync(join(tmpdir(), "hip4-bot-")), "state.json"),
-      recordPath: null,
+      recordTicks: false,
       indices: [7],
       slugs: [],
       patterns: [],
@@ -63,6 +64,7 @@ function harness(over: Partial<BotOptions> = {}) {
       // Gate inputs are injected via setModel / setVol; these never resolve.
       forecast: () => new Promise<number>(() => {}),
       vol: () => new Promise<number>(() => {}),
+      store: new FileStore(statePath, null),
       notify: (t) => sent.push(t),
       now: () => now,
     },
@@ -70,6 +72,7 @@ function harness(over: Partial<BotOptions> = {}) {
   return {
     bot,
     sent,
+    statePath,
     setYes: (v: number | null) => (yes = v),
     setSpot: (v: number) => (spot = v),
     advance: (mins: number) => (now += mins * 60_000),
@@ -77,7 +80,7 @@ function harness(over: Partial<BotOptions> = {}) {
 }
 
 test("buys a model-approved dip and sells it at +5%", async () => {
-  const h = harness();
+  const h = await harness();
   h.bot.setModel(7, 0.6);
   await h.bot.tick(); // YES 0.50 sets the rolling high
   h.setYes(0.47); // -6% from the high
@@ -105,7 +108,7 @@ test("buys a model-approved dip and sells it at +5%", async () => {
 });
 
 test("the model gate vetoes a dip it doesn't value", async () => {
-  const h = harness();
+  const h = await harness();
   h.bot.setModel(7, 0.3); // model thinks YES is worth 0.30, below the 0.475 ask
   await h.bot.tick();
   h.setYes(0.47);
@@ -115,7 +118,7 @@ test("the model gate vetoes a dip it doesn't value", async () => {
 });
 
 test("a NO dip (YES spike) buys NO when the model agrees", async () => {
-  const h = harness();
+  const h = await harness();
   h.bot.setModel(7, 0.4); // P(NO) = 0.6
   await h.bot.tick(); // NO = 0.50
   h.setYes(0.53); // NO 0.47: -6%
@@ -125,7 +128,7 @@ test("a NO dip (YES spike) buys NO when the model agrees", async () => {
 });
 
 test("no entries without a fresh model value", async () => {
-  const h = harness();
+  const h = await harness();
   await h.bot.tick();
   h.setYes(0.47);
   h.advance(1);
@@ -134,7 +137,7 @@ test("no entries without a fresh model value", async () => {
 });
 
 test("--no-model trades the raw dip", async () => {
-  const h = harness({ gate: "none" });
+  const h = await harness({ gate: "none" });
   await h.bot.tick();
   h.setYes(0.47);
   h.advance(1);
@@ -143,7 +146,7 @@ test("--no-model trades the raw dip", async () => {
 });
 
 test("a dip older than the window no longer counts", async () => {
-  const h = harness();
+  const h = await harness();
   h.bot.setModel(7, 0.6);
   await h.bot.tick(); // high 0.50
   h.advance(61); // the 0.50 print leaves the 60m window
@@ -153,7 +156,7 @@ test("a dip older than the window no longer counts", async () => {
 });
 
 test("open positions settle at 1/0 when the market resolves", async () => {
-  const h2 = harness({ gate: "none", takePct: 500 }); // take profit out of reach: hold to resolution
+  const h2 = await harness({ gate: "none", takePct: 500 }); // take profit out of reach: hold to resolution
   await h2.bot.tick();
   h2.setYes(0.47);
   h2.advance(1);
@@ -170,7 +173,7 @@ test("open positions settle at 1/0 when the market resolves", async () => {
 });
 
 test("stop-loss exits and the max-loss breaker halts new entries", async () => {
-  const h = harness({ gate: "none", stopPct: 10, maxLossUsd: 1 });
+  const h = await harness({ gate: "none", stopPct: 10, maxLossUsd: 1 });
   await h.bot.tick();
   h.setYes(0.47);
   h.advance(1);
@@ -191,31 +194,21 @@ test("stop-loss exits and the max-loss breaker halts new entries", async () => {
   assert.equal(h.bot.state.positions.length, 0, "halted bot opens nothing");
 });
 
-test("state persists to disk and a paper state refuses to load in live mode", async () => {
-  const h = harness({ gate: "none" });
+test("state persists through the file store and a paper state refuses to load in live mode", async () => {
+  const h = await harness({ gate: "none" });
   await h.bot.tick();
   h.setYes(0.47);
   h.advance(1);
   await h.bot.tick();
-  const path = (h.bot as any).opts.statePath as string;
-  const saved = JSON.parse(readFileSync(path, "utf8"));
+  const saved = JSON.parse(readFileSync(h.statePath, "utf8"));
   assert.equal(saved.mode, "paper");
   assert.equal(saved.positions.length, 1);
-  assert.throws(
-    () =>
-      new Bot((h.bot as any).opts, {
-        info: {} as any,
-        executor: { mode: "live", buy: async () => ({}) as any, sell: async () => ({}) as any },
-        forecast: async () => 0.5,
-        vol: async () => 0.005,
-        notify: () => {},
-      }),
-    /holds paper state/,
-  );
+  assert.ok(saved.positions[0].id, "positions carry ids");
+  await assert.rejects(new FileStore(h.statePath, null).load("live"), /holds paper state/);
 });
 
 test("fair gate buys a dip that spot doesn't justify (overreaction)", async () => {
-  const h = harness({ gate: "fair" });
+  const h = await harness({ gate: "fair" });
   h.bot.setVol("ETH", 0.005); // 0.5% per hour
   await h.bot.tick(); // spot at the strike, 24h left: fair YES ≈ 0.495
   h.setYes(0.43); // token dumps, spot unchanged
@@ -226,7 +219,7 @@ test("fair gate buys a dip that spot doesn't justify (overreaction)", async () =
 });
 
 test("fair gate skips a dip that is just the market following spot", async () => {
-  const h = harness({ gate: "fair" });
+  const h = await harness({ gate: "fair" });
   h.bot.setVol("ETH", 0.005);
   await h.bot.tick();
   h.setSpot(2512.8); // spot -2%: fair YES ≈ 0.20
@@ -237,7 +230,7 @@ test("fair gate skips a dip that is just the market following spot", async () =>
 });
 
 test("fair gate waits for a volatility estimate", async () => {
-  const h = harness({ gate: "fair" });
+  const h = await harness({ gate: "fair" });
   await h.bot.tick();
   h.setYes(0.43);
   h.advance(1);

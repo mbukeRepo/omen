@@ -30,6 +30,7 @@ jobs:
           fi
       - run: npm ci
       - run: npm run typecheck
+      # Postgres store tests skip here (no service); CI runs them on every push.
       - run: npm test
       - run: npm publish
         env:

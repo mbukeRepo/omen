@@ -117,8 +117,9 @@ Buys a YES/NO token that trades `--dip`% below its rolling `--window`-minute hig
 the gate values it at or above the ask (default `--gate fair`: live digital-option fair
 value from oracle spot, strike, time left and realized vol); sells when the bid is `--take`% above entry. Paper
 mode is safe to start on your own. **`--live` sends real orders: never add it unless the
-user explicitly asked for live trading in this conversation.** State lives in
-`bot-state-<mode>.json`; trades and an hourly summary go to Telegram. It's a long-running
+user explicitly asked for live trading in this conversation.** State, trades and
+ticks live in Postgres when `DATABASE_URL` is set (else `bot-state-<mode>.json`);
+`hip4 report` summarizes positions and PnL. Trades and an hourly summary go to Telegram. It's a long-running
 process: run it with `nohup ... > bot.log 2>&1 &` and read `bot.log`.
 
 ## HIP-4 encoding (for debugging raw data)

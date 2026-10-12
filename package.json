@@ -38,10 +38,12 @@
     "@turnkey/viem": "^0.14.45",
     "commander": "^14.0.1",
     "dotenv": "^16.4.7",
+    "pg": "^8.23.1",
     "viem": "^2.57.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   }

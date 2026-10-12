@@ -777,7 +777,12 @@ program
 
       const tg = cfg.telegram ? new Telegram(cfg.telegram.token, cfg.telegram.chatId) : null;
       const fopts: ForecastOptions = { paths: 50, temperature: 1, days: 90, model: opts.kronos, source: opts.source };
-      const bot = new Bot(
+      const { openStore } = await import("./store.js");
+      const store = await openStore(cfg.databaseUrl, {
+        statePath: opts.state ?? `bot-state-${opts.live ? "live" : "paper"}.json`,
+        ticksPath: opts.record === false ? null : opts.record,
+      });
+      const bot = await Bot.create(
         {
           dipPct: num(opts.dip, "dip"),
           takePct: num(opts.take, "take"),
@@ -791,8 +796,7 @@ program
           minHoursToExpiry: Number(opts.minHours),
           gate: opts.gate as "fair" | "kronos" | "none",
           minEdge: Number(opts.edge) / 100,
-          statePath: opts.state ?? `bot-state-${opts.live ? "live" : "paper"}.json`,
-          recordPath: opts.record === false ? null : opts.record,
+          recordTicks: opts.record !== false,
           indices,
           slugs,
           patterns,
@@ -811,6 +815,7 @@ program
             if (closes.length < 48) throw new Error(`only ${closes.length} 1h candles for ${underlying}`);
             return realizedVol(closes);
           },
+          store,
           notify: (text) => {
             console.log(`\n${text}`);
             tg?.send(text);
@@ -825,7 +830,7 @@ program
         const msg = `🤖 bot stopped — ${open} open position${open === 1 ? "" : "s"} left as-is, realized ${bot.realizedPnl().toFixed(2)} USDC`;
         console.log(`\n${msg}`);
         tg?.send(msg);
-        await tg?.flush();
+        await Promise.allSettled([tg?.flush(), store.end()]);
         process.exit(0);
       };
       process.on("SIGINT", () => void stop());
@@ -833,6 +838,117 @@ program
       await bot.run(ac.signal);
     },
   );
+
+program
+  .command("report")
+  .description("Bot performance from its store: open positions, closed trades, PnL by exit reason")
+  .option("--live", "report the live bot (default: paper)")
+  .option("--state <file>", "file store to read when DATABASE_URL is unset")
+  .action(async (opts: { live?: boolean; state?: string }) => {
+    const { openStore, PgStore } = await import("./store.js");
+    const mode = opts.live ? "live" : "paper";
+    const store = await openStore(cfg.databaseUrl, { statePath: opts.state ?? `bot-state-${mode}.json`, ticksPath: null });
+    try {
+      const s = await store.load(mode);
+      console.log(`${mode} bot — ${store.description}`);
+      const mids = await info.allMids();
+      if (s.positions.length) {
+        console.log("\nopen positions:");
+        console.table(
+          s.positions.map((p) => {
+            const mid = Number(mids[encodeCoin(p.outcome, p.side)] ?? NaN);
+            return {
+              market: `${p.label.slice(0, 40)} [#${p.outcome}]`,
+              side: sideName(p.side),
+              sz: p.sz,
+              entry: p.entryPx.toFixed(4),
+              now: Number.isFinite(mid) ? mid.toFixed(4) : "resolved?",
+              uPnL: Number.isFinite(mid) ? ((mid - p.entryPx) * p.sz).toFixed(2) : "?",
+              opened: new Date(p.openedAt).toISOString().slice(5, 16),
+            };
+          }),
+        );
+      }
+      if (s.closed.length) {
+        console.log("\nclosed trades:");
+        console.table(
+          s.closed.map((t) => ({
+            market: `${t.label.slice(0, 40)} [#${t.outcome}]`,
+            side: sideName(t.side),
+            sz: t.sz,
+            entry: t.entryPx.toFixed(4),
+            exit: t.exitPx.toFixed(4),
+            reason: t.reason,
+            pnl: t.pnl.toFixed(2),
+            closed: new Date(t.closedAt).toISOString().slice(5, 16),
+          })),
+        );
+        const by = new Map<string, { n: number; pnl: number }>();
+        for (const t of s.closed) {
+          const b = by.get(t.reason) ?? { n: 0, pnl: 0 };
+          b.n++;
+          b.pnl += t.pnl;
+          by.set(t.reason, b);
+        }
+        const wins = s.closed.filter((t) => t.pnl > 0).length;
+        const total = s.closed.reduce((a, t) => a + t.pnl, 0);
+        console.log(
+          `\n${s.closed.length} trades, ${wins} winners (${((wins / s.closed.length) * 100).toFixed(0)}%), realized ${total.toFixed(2)} USDC`,
+        );
+        console.log([...by].map(([r, b]) => `  ${r}: ${b.n} trades, ${b.pnl.toFixed(2)} USDC`).join("\n"));
+      }
+      if (!s.positions.length && !s.closed.length) console.log("no positions or trades yet");
+      if (store instanceof PgStore) {
+        const { rows } = await store.query<{ ticks: string; first: Date | null; last: Date | null }>(
+          "SELECT count(DISTINCT ts) AS ticks, min(ts) AS first, max(ts) AS last FROM token_ticks",
+        );
+        const r = rows[0]!;
+        if (r.first) console.log(`\nrecorded ${r.ticks} ticks from ${r.first.toISOString().slice(0, 16)} to ${r.last!.toISOString().slice(0, 16)}`);
+      }
+    } finally {
+      await store.end();
+    }
+  });
+
+const db = program.command("db").description("Postgres storage for the bot (DATABASE_URL)");
+db.command("migrate")
+  .description("Create the bot tables if they don't exist")
+  .action(async () => {
+    if (!cfg.databaseUrl) throw new Error("set DATABASE_URL first, e.g. postgres://localhost/hip4");
+    const { PgStore } = await import("./store.js");
+    const store = await PgStore.connect(cfg.databaseUrl);
+    console.log(`schema ready on ${store.description}`);
+    await store.end();
+  });
+db.command("import")
+  .description("Copy a file-store bot state (and optional tick JSONL) into Postgres")
+  .option("--state <file>", "bot state JSON", "bot-state-paper.json")
+  .option("--ticks <file>", "tick JSONL recorded by the file store")
+  .action(async (opts: { state: string; ticks?: string }) => {
+    if (!cfg.databaseUrl) throw new Error("set DATABASE_URL first, e.g. postgres://localhost/hip4");
+    const { FileStore, PgStore } = await import("./store.js");
+    const { readFileSync, existsSync } = await import("node:fs");
+    const raw = JSON.parse(readFileSync(opts.state, "utf8")) as { mode: "paper" | "live" };
+    const state = await new FileStore(opts.state, null).load(raw.mode);
+    const pg = await PgStore.connect(cfg.databaseUrl);
+    try {
+      for (const p of state.positions) await pg.savePosition(state.mode, p);
+      for (const t of state.closed) await pg.saveTrade(state.mode, t);
+      console.log(`imported ${state.positions.length} open positions and ${state.closed.length} trades (${state.mode})`);
+      if (opts.ticks && existsSync(opts.ticks)) {
+        let n = 0;
+        for (const line of readFileSync(opts.ticks, "utf8").split("\n")) {
+          if (!line.trim()) continue;
+          const row = JSON.parse(line) as { t: number; tokens: Record<string, number>; spot: Record<string, number>; gate: Record<string, number> };
+          await pg.recordTick({ ...row, gateKind: "fair" });
+          n++;
+        }
+        console.log(`imported ${n} ticks`);
+      }
+    } finally {
+      await pg.end();
+    }
+  });
 
 program
   .command("watch")

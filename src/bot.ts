@@ -1,5 +1,6 @@
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import type { ExchangeClient } from "@nktkas/hyperliquid";
+import type { BotState, BotStore, ClosedTrade, OpenPosition } from "./store.js";
 import {
   NO,
   YES,
@@ -110,36 +111,14 @@ export interface BotOptions {
   gate: "fair" | "kronos" | "none";
   /** Gate value must exceed the ask by at least this (probability points, 0-1). */
   minEdge: number;
-  statePath: string;
-  /** Append every tick's token mids and spots here (JSONL) for later replays; null disables. */
-  recordPath: string | null;
+  /** Store every tick's token mids, oracle spots and gate values for later replays. */
+  recordTicks: boolean;
   indices: number[];
   slugs: SlugSpec[];
   patterns: string[];
 }
 
-export interface OpenPosition {
-  outcome: number;
-  side: Side;
-  label: string;
-  sz: number;
-  entryPx: number;
-  openedAt: number;
-  modelP: number | null;
-}
-
-export interface ClosedTrade extends OpenPosition {
-  exitPx: number;
-  closedAt: number;
-  reason: "take" | "stop" | "resolved";
-  pnl: number;
-}
-
-export interface BotState {
-  mode: "paper" | "live";
-  positions: OpenPosition[];
-  closed: ClosedTrade[];
-}
+export type { BotState, ClosedTrade, OpenPosition } from "./store.js";
 
 interface Market {
   outcome: number;
@@ -155,6 +134,7 @@ export interface BotDeps {
   forecast: (fields: { underlying: string; threshold: number; expiryMs: number }) => Promise<number>;
   /** Hourly realized volatility (std of 1h log returns) for an underlying (fair gate). */
   vol: (underlying: string) => Promise<number>;
+  store: BotStore;
   notify: (text: string) => void;
   now?: () => number;
 }
@@ -163,7 +143,6 @@ const META_REFRESH_MS = 10 * 60_000;
 const HEARTBEAT_MS = 60 * 60_000;
 
 export class Bot {
-  readonly state: BotState;
   private markets = new Map<number, Market>();
   private history = new Map<string, { t: number; mid: number }[]>();
   private lastMid = new Map<string, number>();
@@ -179,32 +158,41 @@ export class Bot {
   private lastMetaFetch = 0;
   private lastHeartbeat: number;
   private halted = false;
+  private persistFailed = false;
   private readonly now: () => number;
 
-  constructor(
+  private constructor(
     private readonly opts: BotOptions,
     private readonly deps: BotDeps,
+    readonly state: BotState,
   ) {
     this.now = deps.now ?? Date.now;
     this.lastHeartbeat = this.now();
-    this.state = this.loadState();
   }
 
-  private loadState(): BotState {
-    if (existsSync(this.opts.statePath)) {
-      const s = JSON.parse(readFileSync(this.opts.statePath, "utf8")) as BotState;
-      if (s.mode !== this.deps.executor.mode) {
-        throw new Error(`${this.opts.statePath} holds ${s.mode} state but the bot is running ${this.deps.executor.mode} — use a different --state file`);
+  /** Load open positions and trade history for this mode from the store. */
+  static async create(opts: BotOptions, deps: BotDeps): Promise<Bot> {
+    return new Bot(opts, deps, await deps.store.load(deps.executor.mode));
+  }
+
+  /**
+   * Store writes never abort trading: the in-memory state stays authoritative
+   * while the process runs, and the first failure is surfaced on Telegram.
+   */
+  private async persist(what: string, write: () => Promise<void>): Promise<void> {
+    try {
+      await write();
+      if (this.persistFailed) {
+        this.persistFailed = false;
+        this.deps.notify(`${this.tag()} ✅ store writes recovered (${this.deps.store.description})`);
       }
-      return s;
+    } catch (err) {
+      this.log(`store write failed (${what}): ${String(err).slice(0, 200)}`);
+      if (!this.persistFailed) {
+        this.persistFailed = true;
+        this.deps.notify(`${this.tag()} ⚠️ store write failed (${what}) — trading continues from memory: ${String(err).slice(0, 150)}`);
+      }
     }
-    return { mode: this.deps.executor.mode, positions: [], closed: [] };
-  }
-
-  private saveState(): void {
-    const tmp = `${this.opts.statePath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2));
-    renameSync(tmp, this.opts.statePath);
   }
 
   private tag(): string {
@@ -375,7 +363,7 @@ export class Bot {
       this.opts.gate === "fair" ? this.deps.info.oraclePrices() : Promise.resolve(this.spots),
     ]);
     this.spots = spots;
-    this.recordTick(mids);
+    await this.recordTick(mids);
 
     const highs = new Map<string, number>();
     for (const m of this.markets.values()) {
@@ -391,9 +379,9 @@ export class Bot {
     this.heartbeat(mids);
   }
 
-  /** One JSONL row per tick: token mids, oracle spots and gate values, for replays. */
-  private recordTick(mids: Record<string, string>): void {
-    if (!this.opts.recordPath) return;
+  /** One row per tick: token mids, oracle spots and gate values, for replays. */
+  private async recordTick(mids: Record<string, string>): Promise<void> {
+    if (!this.opts.recordTicks) return;
     const tokens: Record<string, number> = {};
     const gate: Record<string, number> = {};
     const spot: Record<string, number> = {};
@@ -409,9 +397,9 @@ export class Bot {
       }
     }
     try {
-      appendFileSync(this.opts.recordPath, `${JSON.stringify({ t: this.now(), tokens, spot, gate })}\n`);
+      await this.deps.store.recordTick({ t: this.now(), tokens, spot, gate, gateKind: this.opts.gate });
     } catch (err) {
-      this.skip("record", `recording failed: ${String(err).slice(0, 100)}`);
+      this.skip("record", `tick recording failed: ${String(err).slice(0, 100)}`);
     }
   }
 
@@ -421,7 +409,7 @@ export class Bot {
       if (mids[coin] === undefined) {
         // Market stopped quoting: it resolved. Tokens settle at 1 or 0.
         const settle = (this.lastMid.get(coin) ?? pos.entryPx) >= 0.5 ? 1 : 0;
-        this.close(pos, settle, "resolved");
+        await this.close(pos, settle, "resolved");
         continue;
       }
       const book = await this.deps.info.l2Book(coin);
@@ -437,25 +425,26 @@ export class Bot {
         continue;
       }
       if (fill.filledSz < pos.sz) {
-        // Partial exit: book the filled part, keep the rest open.
-        const part: OpenPosition = { ...pos, sz: fill.filledSz };
+        // Partial exit: book the filled part as its own trade, keep the rest open.
+        const part: OpenPosition = { ...pos, id: randomUUID(), sz: fill.filledSz };
         pos.sz -= fill.filledSz;
-        this.close(part, fill.avgPx, reason, false);
-        this.saveState();
+        await this.close(part, fill.avgPx, reason, false);
+        await this.persist("position resize", () => this.deps.store.savePosition(this.state.mode, pos));
       } else {
-        this.close(pos, fill.avgPx, reason);
+        await this.close(pos, fill.avgPx, reason);
       }
     }
   }
 
-  private close(pos: OpenPosition, exitPx: number, reason: ClosedTrade["reason"], remove = true): void {
+  private async close(pos: OpenPosition, exitPx: number, reason: ClosedTrade["reason"], remove = true): Promise<void> {
     const coin = encodeCoin(pos.outcome, pos.side);
     const pnl = (exitPx - pos.entryPx) * pos.sz;
-    this.state.closed.push({ ...pos, exitPx, closedAt: this.now(), reason, pnl });
+    const trade: ClosedTrade = { ...pos, exitPx, closedAt: this.now(), reason, pnl };
+    this.state.closed.push(trade);
     if (remove) this.state.positions = this.state.positions.filter((p) => p !== pos);
     this.lastExit.set(coin, this.now());
     this.history.delete(coin);
-    this.saveState();
+    await this.persist("trade", () => this.deps.store.saveTrade(this.state.mode, trade));
     const icon = reason === "take" ? "💰" : reason === "stop" ? "🛑" : "🏁";
     this.deps.notify(
       [
@@ -519,6 +508,7 @@ export class Bot {
           continue;
         }
         const pos: OpenPosition = {
+          id: randomUUID(),
           outcome: m.outcome,
           side,
           label: m.label,
@@ -529,7 +519,7 @@ export class Bot {
         };
         this.state.positions.push(pos);
         this.history.delete(coin);
-        this.saveState();
+        await this.persist("new position", () => this.deps.store.savePosition(this.state.mode, pos));
         this.deps.notify(
           [
             `${this.tag()} 🛒 BUY ${pos.sz} ${sideName(side)} @ ${pos.entryPx.toFixed(4)} — ${m.label}  [#${m.outcome}]`,
@@ -572,7 +562,8 @@ export class Bot {
         `buy a token ${this.opts.dipPct}% below its ${this.opts.windowMins}m high${this.opts.gate !== "none" ? ` if the ${this.opts.gate} gate values it ≥ ask` : ""}; sell at +${this.opts.takePct}%${this.opts.stopPct !== null ? ` / stop -${this.opts.stopPct}%` : ""}`,
         `${this.opts.usdPerTrade} USDC per trade, max ${this.opts.maxOpen} open, max loss ${this.opts.maxLossUsd} USDC, tick ${this.opts.tickSecs}s`,
         ...this.marketList().map((m) => `• #${m.outcome} ${m.label}`),
-        ...(this.state.positions.length ? [`resuming ${this.state.positions.length} open position(s) from ${this.opts.statePath}`] : []),
+        `store: ${this.deps.store.description}`,
+        ...(this.state.positions.length ? [`resuming ${this.state.positions.length} open position(s)`] : []),
       ].join("\n"),
     );
     while (!signal.aborted) {

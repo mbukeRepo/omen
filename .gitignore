@@ -9,3 +9,4 @@ __pycache__/
 bot-state-*.json
 bot-state-*.json.tmp
 bot-ticks.jsonl
+*.imported

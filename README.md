@@ -201,6 +201,31 @@ Volatility and the Kronos gate use `--source oracle` by default: candles rebuilt
 does it, as the weighted median of Binance (3), OKX (2), Bybit (2), Kraken, KuCoin, Gate
 and MEXC (1 each) per bar. It tracks the venue's own oracle price within about 0.001%.
 
+### Postgres storage
+
+Set `DATABASE_URL` and the bot keeps its state, trades and tick history in Postgres;
+without it, it falls back to `bot-state-<mode>.json` and `bot-ticks.jsonl`.
+
+```sh
+createdb hip4
+echo "DATABASE_URL=postgres://localhost/hip4" >> .env
+hip4 db migrate                      # create tables (the bot also does this on start)
+hip4 db import --state bot-state-paper.json --ticks bot-ticks.jsonl   # move file data over
+hip4 report                          # open positions, trades, PnL by exit reason, tick coverage
+```
+
+Tables: `bot_positions` holds one row per position, open or closed, with paper and live
+kept apart by `mode`. A partial exit writes its own closed row and shrinks the open one.
+`token_ticks`, `spot_ticks` and `gate_ticks` hold one row per coin, underlying or market
+per tick. For example, the bot's realized PnL by day:
+
+```sql
+SELECT date_trunc('day', closed_at) AS day, count(*) AS trades, round(sum(pnl)::numeric, 2) AS pnl
+FROM bot_positions WHERE mode = 'paper' AND status = 'closed' GROUP BY 1 ORDER BY 1;
+```
+
+If a database write fails mid-run, the bot keeps trading from memory and alerts Telegram.
+
 ### Order-book reads: API vs --rpc
 
 Default `book` reads full L2 depth from the info API (HyperCore via REST). With `--rpc`
