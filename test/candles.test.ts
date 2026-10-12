@@ -1,6 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { aggregate } from "../src/candles.js";
+import { aggregate, weightedMedian } from "../src/candles.js";
+
+test("weighted median follows Hyperliquid's oracle weighting", () => {
+  // Binance (3) alone can't outvote OKX (2) + Bybit (2) + four 1-weight venues.
+  const pts = [
+    { value: 100, weight: 3 },
+    { value: 101, weight: 2 },
+    { value: 101, weight: 2 },
+    { value: 102, weight: 1 },
+    { value: 102, weight: 1 },
+    { value: 102, weight: 1 },
+    { value: 102, weight: 1 },
+  ];
+  assert.equal(weightedMedian(pts), 101);
+  assert.equal(weightedMedian([{ value: 5, weight: 1 }]), 5);
+});
 
 const H = 3_600_000;
 const bar = (t: number, o: number, h: number, l: number, c: number, v: number) => ({

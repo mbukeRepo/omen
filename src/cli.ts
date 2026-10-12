@@ -5,6 +5,7 @@ import { loadConfig } from "./config.js";
 import { newLocalWallet, resolveSigner } from "./wallet.js";
 import { Watcher, parseMarketSlug, resolveSlug, type SlugSpec } from "./watch.js";
 import { HyperliquidRpc, OutcomeBboReader } from "./rpc.js";
+import { KRONOS_MODELS, kronosForecast, planForecast, type ForecastOptions } from "./forecast.js";
 import {
   HyperliquidInfo,
   NO,
@@ -487,21 +488,6 @@ function classifyWatchEntries(entries: string[]): { indices: number[]; slugs: Sl
   return { indices, slugs, patterns };
 }
 
-const INTERVALS: [string, number][] = [
-  ["5m", 5 * 60_000],
-  ["15m", 15 * 60_000],
-  ["1h", 3_600_000],
-  ["4h", 4 * 3_600_000],
-  ["1d", 86_400_000],
-];
-
-/** Kronos variants; context length caps how many history bars the model actually sees. */
-const KRONOS_MODELS: Record<string, { model: string; tokenizer: string; ctx: number }> = {
-  mini: { model: "NeoQuasar/Kronos-mini", tokenizer: "NeoQuasar/Kronos-Tokenizer-2k", ctx: 2048 },
-  small: { model: "NeoQuasar/Kronos-small", tokenizer: "NeoQuasar/Kronos-Tokenizer-base", ctx: 512 },
-  base: { model: "NeoQuasar/Kronos-base", tokenizer: "NeoQuasar/Kronos-Tokenizer-base", ctx: 512 },
-};
-
 program
   .command("forecast")
   .description("Kronos model probability for a price-binary market vs the market's own YES mid")
@@ -510,79 +496,34 @@ program
   .option("--temp <t>", "sampling temperature", "1.0")
   .option("--days <n>", "history window in days", "90")
   .option("--model <m>", "mini | small | base (mini has 4x the context)", "small")
-  .option("--source <s>", "candle source: binance | okx | bybit | coinbase | kraken | hl", "binance")
+  .option("--source <s>", "candle source: oracle (HL oracle-weighted median) | binance | okx | bybit | kraken | kucoin | gate | mexc | coinbase | hl", "binance")
   .action(async (market: string, opts: { paths: string; temp: string; days: string; model: string; source: string }) => {
-    const variant = KRONOS_MODELS[opts.model];
-    if (!variant) throw new Error(`--model must be mini, small or base, got "${opts.model}"`);
-    const days = Number(opts.days);
-    if (!(days > 0)) throw new Error(`--days must be > 0, got "${opts.days}"`);
+    const fopts: ForecastOptions = {
+      paths: Number(opts.paths),
+      temperature: Number(opts.temp),
+      days: Number(opts.days),
+      model: opts.model,
+      source: opts.source,
+    };
 
     const { outcome, label } = await resolveMarket(market);
     const meta = await info.outcomeMeta();
     const o = meta.outcomes.find((x) => x.outcome === outcome);
     const fields = o ? priceBinaryFields(o) : null;
     if (!fields) throw new Error(`#${outcome} is not a price binary — forecast only supports "X >= K at T" markets`);
-
-    const now = Date.now();
-    const toExpiry = fields.expiryMs - now;
+    const toExpiry = fields.expiryMs - Date.now();
     if (toExpiry <= 0) throw new Error(`#${outcome} already expired`);
-
-    // Finest interval whose bar count over the history window roughly fits the model
-    // context (25% overflow allowed — the predictor keeps the newest ctx bars anyway).
-    const windowMs = days * 86_400_000;
-    const [interval, intervalMs] =
-      INTERVALS.find(([, ms]) => windowMs / ms <= variant.ctx * 1.25) ?? INTERVALS[INTERVALS.length - 1]!;
-    const lookback = Math.min(variant.ctx, Math.floor(windowMs / intervalMs));
-    const predLen = Math.max(1, Math.ceil(toExpiry / intervalMs));
-    if (predLen > 240) {
-      throw new Error(`horizon is ${predLen} ${interval} bars — too far out for a stable sample; reduce --days or use --model mini`);
-    }
+    const plan = planForecast(fopts, toExpiry);
 
     console.log(`${label}  [#${outcome}]`);
     console.log(
       `underlying ${fields.underlying}, strike ${fields.threshold}, expires in ${(toExpiry / 3_600_000).toFixed(1)}h`,
     );
     console.log(
-      `history: ${days}d of ${interval} bars from ${opts.source} (${lookback} bars, Kronos-${opts.model}) → predict ${predLen} bars x ${opts.paths} paths`,
+      `history: ${fopts.days}d of ${plan.interval} bars from ${fopts.source} (${plan.lookback} bars, Kronos-${fopts.model}) → predict ${plan.predLen} bars x ${fopts.paths} paths`,
     );
-
-    const { fetchCandles } = await import("./candles.js");
-    const raw = await fetchCandles(opts.source, info, fields.underlying, interval, now - intervalMs * (lookback + 2), now);
-    // Last candle is still forming; drop it so the model sees only closed bars.
-    const closed = raw.slice(0, -1).slice(-lookback);
-    if (closed.length < 50) throw new Error(`only ${closed.length} ${interval} candles from ${opts.source} — not enough history`);
-
-    const { spawnSync } = await import("node:child_process");
-    const kronosDir = new URL("../kronos", import.meta.url).pathname;
-    const python = `${kronosDir}/venv/bin/python`;
     console.log("running Kronos (first run downloads model weights)…");
-    const res = spawnSync(python, [`${kronosDir}/forecast.py`], {
-      input: JSON.stringify({
-        candles: closed,
-        intervalMs,
-        predLen,
-        threshold: fields.threshold,
-        paths: Number(opts.paths),
-        temperature: Number(opts.temp),
-        model: variant.model,
-        tokenizer: variant.tokenizer,
-        maxContext: variant.ctx,
-      }),
-      encoding: "utf8",
-      maxBuffer: 64 * 1024 * 1024,
-      timeout: 15 * 60_000,
-    });
-    if (res.error || res.status !== 0) {
-      throw new Error(
-        `forecast sidecar failed (run kronos/setup.sh first?): ${res.error?.message ?? ""}\n${(res.stderr ?? "").slice(-800)}`,
-      );
-    }
-    const out = JSON.parse(res.stdout.trim().split("\n").pop()!) as {
-      device: string;
-      probAbove: number;
-      lastClose: number;
-      finalClose: { q10: number; q50: number; q90: number; mean: number };
-    };
+    const out = await kronosForecast(info, fields, fopts);
 
     const mids = await info.allMids();
     const yesMid = Number(mids[encodeCoin(outcome, YES)] ?? NaN);
@@ -605,7 +546,7 @@ program
   .option("--trials <n>", "number of historical days to test", "60")
   .option("-n, --paths <n>", "sampled paths per trial", "50")
   .option("--model <m>", "mini | small | base", "mini")
-  .option("--source <s>", "binance | okx | bybit | coinbase | kraken | hl", "binance")
+  .option("--source <s>", "oracle | binance | okx | bybit | kraken | kucoin | gate | mexc | coinbase | hl", "binance")
   .option("--offsets <list>", "strike offsets vs spot, %", "-1,-0.5,0,0.5,1")
   .action(async (underlying: string, opts: { trials: string; paths: string; model: string; source: string; offsets: string }) => {
     const variant = KRONOS_MODELS[opts.model];
@@ -773,6 +714,106 @@ program
     const yesRate = rows.reduce((a, r) => a + r.y, 0) / rows.length;
     console.log(`\n${rows.length} markets | Brier ${brier.toFixed(4)} (always-50% = 0.25) | accuracy ${(acc * 100).toFixed(0)}% | YES base rate ${yesRate.toFixed(2)}`);
   });
+
+program
+  .command("bot")
+  .description("Real-time bot: buy outcome tokens that dip from their rolling high (Kronos-gated), sell on +take%. Paper by default")
+  .argument("[markets...]", "outcome indices, trade URLs or name patterns (falls back to WATCH_WHITELIST)")
+  .option("--dip <pct>", "buy when a token trades this % below its rolling high", "5")
+  .option("--take <pct>", "sell when the bid reaches this % above entry", "5")
+  .option("--stop <pct>", "optional stop-loss % below entry")
+  .option("--window <mins>", "rolling-high window in minutes", "60")
+  .option("--tick <secs>", "price check interval in seconds", "5")
+  .option("--model-refresh <mins>", "re-run Kronos per market this often", "60")
+  .option("--usd <n>", "USDC per trade", "20")
+  .option("--max-open <n>", "max simultaneous positions", "3")
+  .option("--max-loss <usd>", "stop opening trades after this realized loss (default 3x --usd)")
+  .option("--min-hours <h>", "no new entries this close to expiry", "2")
+  .option("--edge <pp>", "model must exceed the ask by this many probability points", "0")
+  .option("--no-model", "trade dips without the Kronos gate")
+  .option("--kronos <m>", "Kronos variant for the gate: mini | small | base", "small")
+  .option("--source <s>", "candle source for the gate (oracle = Hyperliquid's oracle-weighted venue median)", "oracle")
+  .option("--live", "send real orders (default: paper fills against the live order book)")
+  .option("--state <file>", "state file (default bot-state-paper.json / bot-state-live.json)")
+  .action(
+    async (
+      markets: string[],
+      opts: {
+        dip: string; take: string; stop?: string; window: string; tick: string; modelRefresh: string; usd: string;
+        maxOpen: string; maxLoss?: string; minHours: string; edge: string; model: boolean; kronos: string;
+        source: string; live?: boolean; state?: string;
+      },
+    ) => {
+      const { Bot, liveExecutor, paperExecutor } = await import("./bot.js");
+      const { Telegram } = await import("./telegram.js");
+      const num = (v: string, name: string, min = 0) => {
+        const n = Number(v);
+        if (!(n > min)) throw new Error(`--${name} must be > ${min}, got "${v}"`);
+        return n;
+      };
+      const usd = num(opts.usd, "usd");
+      if (opts.live && usd < 10) throw new Error("--usd must be at least 10 in live mode (Hyperliquid minimum order value)");
+      if (!KRONOS_MODELS[opts.kronos]) throw new Error(`--kronos must be mini, small or base, got "${opts.kronos}"`);
+
+      const entries = markets.length > 0 ? markets : cfg.watchWhitelist;
+      const { indices, slugs, patterns } = classifyWatchEntries(entries);
+
+      let executor;
+      if (opts.live) {
+        const { exchange, address, kind } = await exchangeClient();
+        console.log(`LIVE MODE — real orders from ${address} (${kind})`);
+        executor = liveExecutor(exchange);
+      } else {
+        executor = paperExecutor();
+      }
+
+      const tg = cfg.telegram ? new Telegram(cfg.telegram.token, cfg.telegram.chatId) : null;
+      const fopts: ForecastOptions = { paths: 50, temperature: 1, days: 90, model: opts.kronos, source: opts.source };
+      const bot = new Bot(
+        {
+          dipPct: num(opts.dip, "dip"),
+          takePct: num(opts.take, "take"),
+          stopPct: opts.stop !== undefined ? num(opts.stop, "stop") : null,
+          windowMins: num(opts.window, "window"),
+          tickSecs: num(opts.tick, "tick", 1),
+          modelRefreshMins: num(opts.modelRefresh, "model-refresh"),
+          usdPerTrade: usd,
+          maxOpen: num(opts.maxOpen, "max-open"),
+          maxLossUsd: opts.maxLoss !== undefined ? num(opts.maxLoss, "max-loss") : usd * 3,
+          minHoursToExpiry: Number(opts.minHours),
+          useModel: opts.model,
+          minEdge: Number(opts.edge) / 100,
+          statePath: opts.state ?? `bot-state-${opts.live ? "live" : "paper"}.json`,
+          indices,
+          slugs,
+          patterns,
+        },
+        {
+          info,
+          executor,
+          forecast: (fields) => kronosForecast(info, fields, fopts).then((r) => r.probAbove),
+          notify: (text) => {
+            console.log(`\n${text}`);
+            tg?.send(text);
+          },
+        },
+      );
+
+      const ac = new AbortController();
+      const stop = async () => {
+        ac.abort();
+        const open = bot.state.positions.length;
+        const msg = `🤖 bot stopped — ${open} open position${open === 1 ? "" : "s"} left as-is, realized ${bot.realizedPnl().toFixed(2)} USDC`;
+        console.log(`\n${msg}`);
+        tg?.send(msg);
+        await tg?.flush();
+        process.exit(0);
+      };
+      process.on("SIGINT", () => void stop());
+      process.on("SIGTERM", () => void stop());
+      await bot.run(ac.signal);
+    },
+  );
 
 program
   .command("watch")

@@ -106,6 +106,20 @@ safe to run; takes a minute or two. Present the result as a model estimate with 
 caveats, never as a trade instruction, and never trade on it without the user's explicit
 go-ahead.
 
+## Trading bot
+
+```sh
+hip4 bot                         # paper mode: real-time dip-buy / take-profit, Kronos-gated
+hip4 bot "(1d)" --dip 5 --take 5 --usd 20 --stop 15
+```
+
+Buys a YES/NO token that trades `--dip`% below its rolling `--window`-minute high when
+Kronos values it at or above the ask; sells when the bid is `--take`% above entry. Paper
+mode is safe to start on your own. **`--live` sends real orders: never add it unless the
+user explicitly asked for live trading in this conversation.** State lives in
+`bot-state-<mode>.json`; trades and an hourly summary go to Telegram. It's a long-running
+process: run it with `nohup ... > bot.log 2>&1 &` and read `bot.log`.
+
 ## HIP-4 encoding (for debugging raw data)
 
 - Book coin for (outcome, side): `#(10*outcome + side)`, side 0=YES 1=NO

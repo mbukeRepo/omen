@@ -165,6 +165,35 @@ near 0.5, so a large "edge" usually means model drift bias at that horizon rathe
 free money. More paths (`-n 100`) tightens the estimate; settlement uses the venue's
 mark/oracle at expiry, not a candle close.
 
+### Trading bot (real time)
+
+`hip4 bot` watches outcome-token prices every few seconds and trades dips:
+
+- **Entry:** a YES or NO token trades `--dip` % (default 5) below its highest price in
+  the last `--window` minutes (default 60). Before buying, Kronos must value the token
+  at or above the ask (`--edge` adds a margin), so a drop the model agrees with isn't
+  bought. Kronos re-runs per market every `--model-refresh` minutes (default 60) in the
+  background, so the model never pauses the price loop. `--no-model` trades raw dips.
+- **Exit:** sell as soon as the bid is `--take` % (default 5) above entry. `--stop` adds an
+  optional stop-loss. Positions still open at expiry settle at 1 or 0.
+- **Risk:** `--usd` per trade (default 20), `--max-open` positions (default 3), no new
+  entries within `--min-hours` of expiry (default 2), and a `--max-loss` breaker (default
+  3× `--usd`) that stops new entries once realized losses reach it.
+- **Modes:** paper by default, with simulated fills against the live order book. `--live`
+  sends real IOC orders through the configured signer (agent key preferred).
+  Positions persist to `bot-state-paper.json` / `bot-state-live.json`, so a restart resumes.
+  Every buy, sell and an hourly summary go to the Telegram channel.
+
+```sh
+hip4 bot                                    # paper, markets from WATCH_WHITELIST
+hip4 bot "(1d)" --usd 25 --stop 15          # all daily binaries, with a stop
+hip4 bot 11382 --live --usd 20              # real orders
+```
+
+The model gate uses `--source oracle` by default: candles rebuilt as Hyperliquid's oracle
+does it, as the weighted median of Binance (3), OKX (2), Bybit (2), Kraken, KuCoin, Gate
+and MEXC (1 each) per bar. It tracks the venue's own oracle price within about 0.001%.
+
 ### Order-book reads: API vs --rpc
 
 Default `book` reads full L2 depth from the info API (HyperCore via REST). With `--rpc`

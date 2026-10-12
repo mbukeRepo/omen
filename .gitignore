@@ -6,3 +6,5 @@ dist/
 kronos/venv/
 kronos/vendor/
 __pycache__/
+bot-state-*.json
+bot-state-*.json.tmp
