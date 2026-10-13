@@ -393,30 +393,43 @@ program
 
 program
   .command("orders")
-  .description("List open orders for the signing address")
-  .action(async () => {
-    const address = await signerAddress();
-    const [orders, meta] = await Promise.all([info.openOrders(address), info.outcomeMeta()]);
+  .description("List open limit orders — the signer's, or any address's with --user; --tg posts to Telegram")
+  .option("--user <address>", "read this address instead of the signing wallet")
+  .option("--tg", "also post the result to the Telegram channel")
+  .action(async (opts: { user?: string; tg?: boolean }) => {
+    const address = opts.user ?? (await signerAddress());
+    const [orders, meta, mids] = await Promise.all([info.openOrders(address), info.outcomeMeta(), info.allMids()]);
     const hip4 = orders.filter((o) => o.coin.startsWith("#"));
-    if (hip4.length === 0) {
-      console.log("no open HIP-4 orders");
-      return;
+    const other = orders.length - hip4.length;
+    const { marketUrl: urlFor } = await import("./watch.js");
+
+    const blocks = hip4.map((o) => {
+      const { outcome, side } = decodeCoin(o.coin);
+      const m = meta.outcomes.find((x) => x.outcome === outcome);
+      const label = m ? describeOutcome(m, meta.questions) : `outcome ${outcome}`;
+      const exp = m ? outcomeExpiryMs(m, meta.questions) : null;
+      const mid = mids[o.coin];
+      const notional = Number(o.limitPx) * Number(o.sz);
+      return [
+        `• ${o.side === "B" ? "BUY" : "SELL"} ${o.sz} ${sideName(side)} @ ${o.limitPx} — ${label}  [#${outcome}]`,
+        `  notional ${notional.toFixed(2)} USDC | mid now ${mid ?? "—"} | oid ${o.oid} | placed ${new Date(o.timestamp).toISOString().slice(5, 16)}Z`,
+        ...(exp ? [`  expires ${new Date(exp).toISOString().slice(0, 16)} UTC`] : []),
+        ...(m && urlFor(m) ? [`  ${urlFor(m)}`] : []),
+      ].join("\n");
+    });
+    const text = [
+      `📋 open HIP-4 orders for ${address}: ${hip4.length}${other > 0 ? ` (+${other} non-HIP-4 orders not shown)` : ""}`,
+      ...blocks,
+    ].join("\n\n");
+    console.log(text);
+    if (opts.tg) {
+      if (!cfg.telegram) throw new Error("--tg needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env");
+      const { Telegram } = await import("./telegram.js");
+      const tg = new Telegram(cfg.telegram.token, cfg.telegram.chatId);
+      tg.send(text);
+      await tg.flush();
+      console.log("\n(sent to Telegram)");
     }
-    const rows = await Promise.all(
-      hip4.map(async (o) => {
-        const { outcome, side } = decodeCoin(o.coin);
-        return {
-          oid: o.oid,
-          coin: o.coin,
-          dir: o.side === "B" ? "buy" : "sell",
-          token: sideName(side),
-          px: o.limitPx,
-          sz: o.sz,
-          market: (await labelFor(meta, outcome)).slice(0, 60),
-        };
-      }),
-    );
-    console.table(rows);
   });
 
 program
@@ -435,40 +448,53 @@ program
 
 program
   .command("positions")
-  .description("Show held outcome tokens (spot balances on '+N' coins)")
-  .action(async () => {
-    const address = await signerAddress();
+  .description("Show held outcome tokens — the signer's, or any address's with --user; --tg posts to Telegram")
+  .option("--user <address>", "read this address instead of the signing wallet")
+  .option("--tg", "also post the result to the Telegram channel")
+  .action(async (opts: { user?: string; tg?: boolean }) => {
+    const address = opts.user ?? (await signerAddress());
     const [balances, meta, mids] = await Promise.all([
       info.spotBalances(address),
       info.outcomeMeta(),
       info.allMids(),
     ]);
+    const { marketUrl: urlFor } = await import("./watch.js");
     const held = balances.filter((b) => b.coin.startsWith("+") && Number(b.total) > 0);
-    if (held.length === 0) {
-      console.log("no outcome token positions");
-      return;
+    const usdc = balances.find((b) => b.coin === "USDC");
+
+    let totalUpnl = 0;
+    const blocks = held.map((b) => {
+      const { outcome, side } = decodeCoin(b.coin);
+      const m = meta.outcomes.find((x) => x.outcome === outcome);
+      const label = m ? describeOutcome(m, meta.questions) : `outcome ${outcome}`;
+      const exp = m ? outcomeExpiryMs(m, meta.questions) : null;
+      const mid = mids[encodeCoin(outcome, side)];
+      const sz = Number(b.total);
+      const entryNtl = b.entryNtl !== undefined ? Number(b.entryNtl) : NaN;
+      const entryPx = Number.isFinite(entryNtl) && sz > 0 ? entryNtl / sz : null;
+      const upnl = entryPx !== null && mid !== undefined ? (Number(mid) - entryPx) * sz : null;
+      if (upnl !== null) totalUpnl += upnl;
+      return [
+        `• ${b.total} ${sideName(side)} — ${label}  [#${outcome}]`,
+        `  avg entry ${entryPx !== null ? entryPx.toFixed(4) : "?"} | mid now ${mid ?? "—"} | uPnL ${upnl !== null ? `${upnl >= 0 ? "+" : ""}${upnl.toFixed(2)} USDC` : "?"}${Number(b.hold) > 0 ? ` | ${b.hold} on hold (resting orders)` : ""}`,
+        ...(exp ? [`  expires ${new Date(exp).toISOString().slice(0, 16)} UTC`] : []),
+        ...(m && urlFor(m) ? [`  ${urlFor(m)}`] : []),
+      ].join("\n");
+    });
+    const text = [
+      `💼 HIP-4 positions for ${address}: ${held.length}` +
+        ` | spot USDC ${usdc?.total ?? "0"}${held.length ? ` | total uPnL ${totalUpnl >= 0 ? "+" : ""}${totalUpnl.toFixed(2)} USDC` : ""}`,
+      ...blocks,
+    ].join("\n\n");
+    console.log(text);
+    if (opts.tg) {
+      if (!cfg.telegram) throw new Error("--tg needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env");
+      const { Telegram } = await import("./telegram.js");
+      const tg = new Telegram(cfg.telegram.token, cfg.telegram.chatId);
+      tg.send(text);
+      await tg.flush();
+      console.log("\n(sent to Telegram)");
     }
-    const rows = await Promise.all(
-      held.map(async (b) => {
-        const { outcome, side } = decodeCoin(b.coin);
-        const mid = mids[encodeCoin(outcome, side)];
-        const sz = Number(b.total);
-        const entryNtl = b.entryNtl !== undefined ? Number(b.entryNtl) : NaN;
-        const entryPx = Number.isFinite(entryNtl) && sz > 0 ? entryNtl / sz : null;
-        const upnl = entryPx !== null && mid !== undefined ? (Number(mid) - entryPx) * sz : null;
-        return {
-          coin: b.coin,
-          token: sideName(side),
-          sz: b.total,
-          hold: b.hold,
-          entry: entryPx !== null ? entryPx.toFixed(4) : "?",
-          mid: mid ?? "?",
-          uPnL: upnl !== null ? `${upnl >= 0 ? "+" : ""}${upnl.toFixed(2)}` : "?",
-          market: (await labelFor(meta, outcome)).slice(0, 60),
-        };
-      }),
-    );
-    console.table(rows);
   });
 
 /** Classify watchlist entries: outcome index, trade URL/slug, or name pattern. */
