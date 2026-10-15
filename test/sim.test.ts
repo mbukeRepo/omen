@@ -23,6 +23,7 @@ const opts: SimOptions = {
   minHoursToExpiry: 2,
   gate: "fair",
   minEdge: 0,
+  snipeEdge: null,
 };
 
 /** A minute-by-minute path of YES mids (1-tick spread) and ETH spots. */

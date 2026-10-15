@@ -46,6 +46,7 @@ async function harness(over: Partial<BotOptions> = {}) {
       minHoursToExpiry: 2,
       gate: "kronos",
       minEdge: 0,
+      snipeEdge: null,
       recordTicks: false,
       indices: [7],
       slugs: [],
@@ -238,5 +239,22 @@ test("fair gate waits for a volatility estimate", async () => {
   h.setYes(0.43);
   h.advance(1);
   await h.bot.tick();
+  assert.equal(h.bot.state.positions.length, 0);
+});
+
+test("snipe mode buys a stale quote below the gate value, no dip required", async () => {
+  const h = await harness({ gate: "fair", snipeEdge: 0.05 });
+  h.bot.setVol("ETH", 0.005);
+  h.setSpot(2620); // spot jumped: fair YES ≈ 0.93, but the book still quotes 0.50
+  await h.bot.tick();
+  assert.equal(h.bot.state.positions.length, 1);
+  assert.equal(h.bot.state.positions[0]!.side, 0);
+  assert.match(h.sent.at(-1)!, /SNIPE/);
+});
+
+test("snipe stays quiet when quotes track fair value", async () => {
+  const h = await harness({ gate: "fair", snipeEdge: 0.05 });
+  h.bot.setVol("ETH", 0.005);
+  await h.bot.tick(); // spot at strike, fair ≈ 0.49, mid 0.50 — no gap
   assert.equal(h.bot.state.positions.length, 0);
 });

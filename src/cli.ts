@@ -773,6 +773,7 @@ program
   .option("--max-loss <usd>", "stop opening trades after this realized loss (default 3x --usd)")
   .option("--min-hours <h>", "no new entries this close to expiry", "2")
   .option("--edge <pp>", "model must exceed the ask by this many probability points", "0")
+  .option("--snipe <pp>", "also buy any side whose ask sits this many points below the live gate value (stale-quote catcher)")
   .option("--gate <g>", "fair (live digital fair value) | kronos | none", "fair")
   .option("--record <file>", "append every tick's token prices, spots and gate values (JSONL)", "bot-ticks.jsonl")
   .option("--no-record", "don't record ticks")
@@ -785,7 +786,7 @@ program
       markets: string[],
       opts: {
         dip: string; take: string; stop?: string; window: string; tick: string; modelRefresh: string; usd: string;
-        maxOpen: string; maxLoss?: string; minHours: string; edge: string; gate: string; record: string | false; kronos: string;
+        maxOpen: string; maxLoss?: string; minHours: string; edge: string; snipe?: string; gate: string; record: string | false; kronos: string;
         source: string; live?: boolean; state?: string;
       },
     ) => {
@@ -834,6 +835,7 @@ program
           minHoursToExpiry: Number(opts.minHours),
           gate: opts.gate as "fair" | "kronos" | "none",
           minEdge: Number(opts.edge) / 100,
+          snipeEdge: opts.snipe !== undefined ? num(opts.snipe, "snipe") / 100 : null,
           recordTicks: opts.record !== false,
           indices,
           slugs,
@@ -1052,7 +1054,7 @@ program
                 {
                   dipPct: dip, takePct: take, stopPct: opts.stop ? Number(opts.stop) : null, windowMins: Number(opts.window),
                   tickSecs: 5, modelRefreshMins: 60, usdPerTrade: Number(opts.usd), maxOpen: 3, maxLossUsd: Number(opts.usd) * 3,
-                  minHoursToExpiry: 2, gate, minEdge: 0,
+                  minHoursToExpiry: 2, gate, minEdge: 0, snipeEdge: null,
                 },
                 vols,
               );

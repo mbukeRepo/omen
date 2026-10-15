@@ -111,6 +111,12 @@ export interface BotOptions {
   gate: "fair" | "kronos" | "none";
   /** Gate value must exceed the ask by at least this (probability points, 0-1). */
   minEdge: number;
+  /**
+   * Snipe mode: buy ANY side whose ask sits this many probability points (0-1)
+   * below the live gate value, no dip required — catches stale quotes in the
+   * seconds after an event moves spot before token books reprice. Null disables.
+   */
+  snipeEdge: number | null;
   /** Store every tick's token mids, oracle spots and gate values for later replays. */
   recordTicks: boolean;
   indices: number[];
@@ -493,6 +499,21 @@ export class Bot {
         const high = highs.get(coin);
         if (raw === undefined || !high) continue;
         const mid = Number(raw);
+
+        // Snipe path: gate value far above the quote, dip not required.
+        if (this.opts.snipeEdge !== null) {
+          const pYes = this.gateYes(m);
+          const sideVal = pYes !== null ? (side === YES ? pYes : 1 - pYes) : null;
+          if (sideVal !== null && sideVal - mid >= this.opts.snipeEdge) {
+            const book = await this.deps.info.l2Book(coin);
+            const ask = book.asks[0];
+            if (ask && sideVal - ask.px >= this.opts.snipeEdge) {
+              if (await this.enter(m, side, book, ask.px, sideVal, `SNIPE: ${this.opts.gate} value ${sideVal.toFixed(3)} vs ask ${ask.px.toFixed(4)} (+${((sideVal - ask.px) * 100).toFixed(1)}pp stale)`)) break;
+              continue;
+            }
+          }
+        }
+
         const dropPct = ((high - mid) / high) * 100;
         if (dropPct < this.opts.dipPct) continue;
         const lastExit = this.lastExit.get(coin);
@@ -520,38 +541,48 @@ export class Bot {
             continue;
           }
         }
-        const sz = Math.floor(this.opts.usdPerTrade / ask.px);
-        if (sz < 1) continue;
-
-        const fill = await this.deps.executor.buy(m.outcome, side, ask.px, sz, book);
-        if (fill.filledSz <= 0) {
-          this.skip(coin, `buy unfilled: ${fill.error ?? "?"}`);
-          continue;
-        }
-        const pos: OpenPosition = {
-          id: randomUUID(),
-          outcome: m.outcome,
-          side,
-          label: m.label,
-          sz: fill.filledSz,
-          entryPx: fill.avgPx,
-          openedAt: this.now(),
-          modelP,
-        };
-        this.state.positions.push(pos);
-        this.history.delete(coin);
-        await this.persist("new position", () => this.deps.store.savePosition(this.state.mode, pos));
-        this.deps.notify(
-          [
-            `${this.tag()} 🛒 BUY ${pos.sz} ${sideName(side)} @ ${pos.entryPx.toFixed(4)} — ${m.label}  [#${m.outcome}]`,
-            `dipped ${dropPct.toFixed(1)}% from ${high.toFixed(4)} in ${this.opts.windowMins}m${modelP !== null ? ` | ${this.opts.gate} value ${modelP.toFixed(3)} vs ask ${ask.px.toFixed(4)}` : ""}`,
-            `take profit at ${(pos.entryPx * (1 + this.opts.takePct / 100)).toFixed(4)}${this.opts.stopPct !== null ? ` | stop ${(pos.entryPx * (1 - this.opts.stopPct / 100)).toFixed(4)}` : ""}`,
-            ...(m.url ? [m.url] : []),
-          ].join("\n"),
-        );
-        break; // one side per market
+        if (await this.enter(m, side, book, ask.px, modelP, `dipped ${dropPct.toFixed(1)}% from ${high.toFixed(4)} in ${this.opts.windowMins}m${modelP !== null ? ` | ${this.opts.gate} value ${modelP.toFixed(3)} vs ask ${ask.px.toFixed(4)}` : ""}`)) break;
       }
     }
+  }
+
+  /** Buy at the ask and register the position; true when a position was opened (one side per market). */
+  private async enter(m: Market, side: Side, book: Book, askPx: number, modelP: number | null, note: string): Promise<boolean> {
+    const coin = encodeCoin(m.outcome, side);
+    const lastExit = this.lastExit.get(coin);
+    if (lastExit && this.now() - lastExit < this.opts.windowMins * 60_000) {
+      this.skip(coin, "entry ignored: cooling down after a recent exit");
+      return false;
+    }
+    const sz = Math.floor(this.opts.usdPerTrade / askPx);
+    if (sz < 1) return false;
+    const fill = await this.deps.executor.buy(m.outcome, side, askPx, sz, book);
+    if (fill.filledSz <= 0) {
+      this.skip(coin, `buy unfilled: ${fill.error ?? "?"}`);
+      return false;
+    }
+    const pos: OpenPosition = {
+      id: randomUUID(),
+      outcome: m.outcome,
+      side,
+      label: m.label,
+      sz: fill.filledSz,
+      entryPx: fill.avgPx,
+      openedAt: this.now(),
+      modelP,
+    };
+    this.state.positions.push(pos);
+    this.history.delete(coin);
+    await this.persist("new position", () => this.deps.store.savePosition(this.state.mode, pos));
+    this.deps.notify(
+      [
+        `${this.tag()} 🛒 BUY ${pos.sz} ${sideName(side)} @ ${pos.entryPx.toFixed(4)} — ${m.label}  [#${m.outcome}]`,
+        note,
+        `take profit at ${(pos.entryPx * (1 + this.opts.takePct / 100)).toFixed(4)}${this.opts.stopPct !== null ? ` | stop ${(pos.entryPx * (1 - this.opts.stopPct / 100)).toFixed(4)}` : ""}`,
+        ...(m.url ? [m.url] : []),
+      ].join("\n"),
+    );
+    return true;
   }
 
   private heartbeat(mids: Record<string, string>): void {
