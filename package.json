@@ -30,7 +30,8 @@
     "hip4": "tsx src/cli.ts",
     "typecheck": "tsc -p tsconfig.check.json",
     "test": "node --import tsx --test test/*.test.ts",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "test:e2e": "tsx test/snipe.e2e.ts"
   },
   "dependencies": {
     "@nktkas/hyperliquid": "^0.33.3",
