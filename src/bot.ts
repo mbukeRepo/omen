@@ -160,6 +160,7 @@ export class Bot {
   private volPending = new Set<string>();
   private modelBusy = false;
   private lastExit = new Map<string, number>();
+  private lastSnipeAlert = new Map<string, number>();
   private lastSkip = new Map<string, string>();
   private lastMetaFetch = 0;
   private lastHeartbeat: number;
@@ -508,7 +509,13 @@ export class Bot {
             const book = await this.deps.info.l2Book(coin);
             const ask = book.asks[0];
             if (ask && sideVal - ask.px >= this.opts.snipeEdge) {
-              if (await this.enter(m, side, book, ask.px, sideVal, `SNIPE: ${this.opts.gate} value ${sideVal.toFixed(3)} vs ask ${ask.px.toFixed(4)} (+${((sideVal - ask.px) * 100).toFixed(1)}pp stale)`)) break;
+              const note = `SNIPE: ${this.opts.gate} value ${sideVal.toFixed(3)} vs ask ${ask.px.toFixed(4)} (+${((sideVal - ask.px) * 100).toFixed(1)}pp stale)`;
+              if (await this.enter(m, side, book, ask.px, sideVal, note)) break;
+              // A detected-but-missed snipe is worth a channel alert too (throttled).
+              if (this.now() - (this.lastSnipeAlert.get(coin) ?? 0) > 10 * 60_000) {
+                this.lastSnipeAlert.set(coin, this.now());
+                this.deps.notify(`${this.tag()} 🎯 snipe DETECTED but not filled on ${sideName(side)} — ${note} — ${m.label}  [#${m.outcome}]`);
+              }
               continue;
             }
           }
