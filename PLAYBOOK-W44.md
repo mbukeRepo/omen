@@ -64,18 +64,18 @@ established ≥0.80 favorite may exist there.
 
 | Day | Time | Event | Posture |
 |---|---|---|---|
-| Mon 26 | — | quiet | flat; fund; confirm dates; record |
-| Tue 27 | ~20:30 | MSFT/GOOGL earnings (unconfirmed day) | observe; snipe-only ≥5pp |
-| **Wed 28** | **18:00 / 18:30** | **FOMC + presser** | main trade: playcards A1 + B1 |
-| Thu 29 | 12:30 / 13:15 / 13:30 | GDP + ECB + US open (fade stat: 64%) | no taker entries 12:00–14:30; maker paper |
+| Mon 26 | — | quiet | flat; fund; record (dates confirmed ✓) |
+| Tue 27 | — | quiet (earnings moved to Wed) | flat; maker paper rehearsal |
+| **Wed 28** | **18:00 / 18:30** | **FOMC + presser** | playcard A1 |
+| **Wed 28** | **~20:10–21:30** | **MSFT + GOOGL earnings (confirmed)** | A1 window extended; B1 entry AFTER this |
+| Thu 29 | 12:30 / 13:15 / 13:30 | **GDP + PCE (same release, BEA-confirmed) + ECB + US open** | triple stack: no taker entries 12:00–14:30; maker paper |
 | Thu 29 | ~20:30 | AMZN (+AAPL/META?) earnings | observe; snipe-only |
-| **Fri 30** | **~02:30–03:00 / 06:30** | **BoJ decision / presser** | playcard A2; **carry blackout 02:00–06:00** |
-| Fri 30 | 12:30 | PCE (if not Thu) | snipe-only, settles Sat 06:00 |
+| **Fri 30** | **~02:30–03:00 / 06:30** | **BoJ decision / presser** (only event Friday) | playcard A2; **carry blackout 02:00–06:00** |
 | Sat 31 | — | BTC monthly close | flat into it |
 
 ## 4. Playcards
 
-### A1 — FOMC snipe (Wed 17:45–19:30)
+### A1 — FOMC + earnings snipe (Wed 17:45–21:45)
 - **Arm 17:45:** `hip4 bot "(1d)" --snipe 4 --edge 2 --tick 2 --usd 20 --max-open 3 --max-loss 30 --min-hours 2`
   (paper unless §0 complete; snipe 4pp here because event vol makes fair move faster than books)
 - **Standing orders cancelled by 17:30.** No position near strike at 18:00. No entries 17:30–18:00.
@@ -83,16 +83,20 @@ established ≥0.80 favorite may exist there.
   - |Δspot| < 0.3% → stand down; dislocations won't exceed the spread
   - Δspot ≥ +0.5% → snipe stale YES asks ≥4pp under live fair; mirror NO on ≤ −0.5%
   - spot crosses K twice within 30 min → stand down entirely (whipsaw/pin)
-- Exit: bot takes +5%; manual flatten anything left by 19:30 unless it qualifies for B1.
+- Keep the bot armed through the MSFT/GOOGL releases (~20:10–21:30): an NDX impulse off
+  earnings is a second, independent dislocation window on the same daily.
+- Exit: bot takes +5%; manual flatten anything left by 21:45 unless it qualifies for B1.
 - Max event risk: 3 × $20 premium + $30 daily halt already counts it.
 
-### B1 — FOMC post-confirmation hold (Wed 19:00–19:30 entry)
-Enter ONLY if all five, checked at 19:00:
-1. ≥30 min since the presser started, direction one-way since
+### B1 — post-confirmation hold (Wed, entry 21:30–22:00 — AFTER earnings)
+MSFT + GOOGL report ~20:10–21:30 UTC (confirmed), so the old 19:00 entry violated the
+"no pending print" rule. Entry moves to after both releases; ~8h to settlement remains.
+Enter ONLY if all five, checked at 21:30:
+1. direction one-way since the FOMC presser AND not reversed by earnings
 2. spot ≥ 0.5% beyond the Wednesday daily's strike (≥ K·1.005 or ≤ K·0.995)
 3. favorite ask ∈ **0.75–0.83** and within 2pp of `hip4 forecast` fair
 4. top-of-book ≥ 3× our size
-5. no second print pending before settlement
+5. no further scheduled print before settlement (none exists after 21:30 Wed)
 - **Entry:** `hip4 buy <outcome> <side> -p <ask+0.01> -s <⌊30/ask⌋> -t Ioc` ($30 premium)
 - **Exit:** settlement; mandatory abort the moment spot recrosses K (expect ~−$12);
   no stop otherwise. Expected payoff: +$6–9 (+20–30%) vs capped −$12 ≈ 60/40 at fair odds.
