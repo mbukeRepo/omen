@@ -5,7 +5,7 @@ import { loadConfig } from "./config.js";
 import { newLocalWallet, resolveSigner } from "./wallet.js";
 import { Watcher, parseMarketSlug, resolveSlug, type SlugSpec } from "./watch.js";
 import { HyperliquidRpc, OutcomeBboReader } from "./rpc.js";
-import { KRONOS_MODELS, kronosForecast, planForecast, type ForecastOptions } from "./forecast.js";
+import { KRONOS_MODELS, kronosForecast, kronosStudy, planForecast, type ForecastOptions } from "./forecast.js";
 import {
   HyperliquidInfo,
   NO,
@@ -515,6 +515,74 @@ function classifyWatchEntries(entries: string[]): { indices: number[]; slugs: Sl
 }
 
 program
+  .command("study")
+  .description("Kronos candle study in plain English: describes the shape of possible futures, makes no prediction")
+  .argument("<what>", "underlying symbol (BTC, ETH) or outcome index / trade URL")
+  .option("--hours <h>", "horizon in hours (symbol mode; market mode uses time to expiry)", "12")
+  .option("--levels <list>", "comma-separated price levels to check touch odds for")
+  .option("-n, --paths <n>", "sampled futures", "100")
+  .option("--days <n>", "history window in days (90 keeps 1h bars for intraday horizons)", "90")
+  .option("--model <m>", "mini | small | base", "mini")
+  .option("--source <s>", "candle source", "binance")
+  .action(async (what: string, opts: { hours: string; levels?: string; paths: string; days: string; model: string; source: string }) => {
+    const fopts: ForecastOptions = { paths: Number(opts.paths), temperature: 1, days: Number(opts.days), model: opts.model, source: opts.source };
+    let underlying = what.toUpperCase();
+    let horizonMs = Number(opts.hours) * 3_600_000;
+    const levels: number[] = opts.levels ? opts.levels.split(",").map(Number) : [];
+    if (!/^[A-Z]{2,10}$/.test(underlying)) {
+      const { outcome } = await resolveMarket(what);
+      const meta = await info.outcomeMeta();
+      const o = meta.outcomes.find((x) => x.outcome === outcome);
+      const fields = o ? priceBinaryFields(o) : null;
+      if (!fields) throw new Error(`#${outcome} is not a price binary`);
+      underlying = fields.underlying;
+      horizonMs = fields.expiryMs - Date.now();
+      if (!levels.includes(fields.threshold)) levels.push(fields.threshold);
+    }
+
+    console.log(`studying ${underlying} over the next ${(horizonMs / 3_600_000).toFixed(1)}h — sampling ${fopts.paths} possible futures (Kronos-${fopts.model}, ${fopts.source})…`);
+    const s = await kronosStudy(info, { underlying, horizonMs, levels }, fopts);
+
+    const pct = (x: number) => `${(x * 100).toFixed(0)}%`;
+    const px = (x: number) => x.toLocaleString("en-US", { maximumFractionDigits: x > 100 ? 0 : 4 });
+    const hrs = (bar: number) => ((bar * s.intervalMs) / 3_600_000).toFixed(bar * s.intervalMs < 3_600_000 ? 1 : 0);
+
+    console.log(`\nThe model looked at ${s.lookback} ${s.interval} candles and imagined ${s.paths} ways the next ${hrs(s.predLen)}h could go.`);
+    console.log(`This is a description of those imagined futures — not a prediction.\n`);
+
+    console.log(`Starting point: ${px(s.start)}\n`);
+
+    console.log(`HOW WILD? (expected candle size vs the last 2 days)`);
+    const ratio = s.predRangePct / Math.max(s.realizedRangePct, 1e-9);
+    const mood = ratio > 1.3 ? "a STORMIER market than recently" : ratio < 0.75 ? "a CALMER market than recently" : "about the same weather as recently";
+    console.log(`  recent candles moved ~${(s.realizedRangePct * 100).toFixed(2)}% each; the model imagines ~${(s.predRangePct * 100).toFixed(2)}% → ${mood}\n`);
+
+    console.log(`WHICH WAY DO THE FUTURES LEAN? (ends beyond ±0.5% of start)`);
+    console.log(`  ${pct(s.character.up)} end clearly higher | ${pct(s.character.flat)} end sideways | ${pct(s.character.down)} end clearly lower`);
+    const lean = s.character.up - s.character.down;
+    console.log(`  → ${Math.abs(lean) < 0.15 ? "no real lean: this is a coin flip" : lean > 0 ? "more futures go up than down" : "more futures go down than up"}\n`);
+
+    console.log(`THE CONE (where the middle 80% of futures sit)`);
+    for (const c of s.cone) console.log(`  after ${hrs(c.bar)}h: ${px(c.q10)} … ${px(c.q50)} … ${px(c.q90)}`);
+    const upTail = s.finals.q90 - s.finals.q50;
+    const downTail = s.finals.q50 - s.finals.q10;
+    console.log(`  surprise sizes: up-surprise ${px(upTail)}, down-surprise ${px(downTail)} → ${s.skew > 1.25 ? "the BIG surprise lives on the UPSIDE" : s.skew < 0.8 ? "the BIG surprise lives on the DOWNSIDE" : "surprises are balanced"}\n`);
+
+    console.log(`THE JOURNEY (what happens along the way, in the typical future)`);
+    console.log(`  typical worst dip: ${(s.medianMaxDrawdownPct * 100).toFixed(2)}% | typical best pop: +${(s.medianMaxDrawupPct * 100).toFixed(2)}%`);
+    console.log(`  (a position must survive the dip to enjoy the end)\n`);
+
+    if (s.touch.length) {
+      console.log(`LEVEL TOUCH ODDS (how many futures visit each level at least once)`);
+      for (const t of s.touch) {
+        const dir = t.level >= s.start ? `touched: ${pct(t.touchAbove)}` : `touched: ${pct(t.touchBelow)}`;
+        console.log(`  ${px(t.level)} (${(((t.level - s.start) / s.start) * 100).toFixed(2)}% away): ${dir}, still above it at the end: ${pct(t.endAbove)}`);
+      }
+      console.log(`  (touch odds are always higher than end odds — prices visit places they don't stay)`);
+    }
+  });
+
+program
   .command("forecast")
   .description("Kronos model probability for a price-binary market vs the market's own YES mid")
   .argument("<market>", "outcome index or app.hyperliquid.xyz trade URL (price binaries only)")
@@ -876,6 +944,68 @@ program
       process.on("SIGINT", () => void stop());
       process.on("SIGTERM", () => void stop());
       await bot.run(ac.signal);
+    },
+  );
+
+program
+  .command("make")
+  .description("Paper market maker: rest post-only quotes at fair ± half on both books and measure spread capture vs adverse selection (playcard C1; paper only)")
+  .argument("[markets...]", "outcome indices, trade URLs or name patterns (falls back to WATCH_WHITELIST)")
+  .option("--half <pp>", "half-spread around fair value, probability points", "2")
+  .option("--usd <n>", "USDC premium per quote", "15")
+  .option("--cap <usd>", "max net YES-equivalent inventory premium, USDC", "45")
+  .option("--tick <secs>", "quote/fill check interval", "5")
+  .option("--flatten-hours <h>", "pull quotes and close inventory this close to expiry", "3")
+  .option("--vol-refresh <mins>", "refresh hourly realized vol this often", "60")
+  .option("--source <s>", "candle source for vol (oracle|binance|…)", "oracle")
+  .option("--record <file>", "JSONL file for fills, markouts and summaries", "maker-paper.jsonl")
+  .action(
+    async (
+      markets: string[],
+      opts: { half: string; usd: string; cap: string; tick: string; flattenHours: string; volRefresh: string; source: string; record: string },
+    ) => {
+      const { Maker } = await import("./maker.js");
+      const { Telegram } = await import("./telegram.js");
+      const entries = markets.length > 0 ? markets : cfg.watchWhitelist;
+      const { indices, slugs, patterns } = classifyWatchEntries(entries);
+      const tg = cfg.telegram ? new Telegram(cfg.telegram.token, cfg.telegram.chatId) : null;
+      const maker = new Maker(
+        {
+          half: Number(opts.half) / 100,
+          usdPerQuote: Number(opts.usd),
+          capUsd: Number(opts.cap),
+          tickSecs: Math.max(2, Number(opts.tick)),
+          flattenHours: Number(opts.flattenHours),
+          volRefreshMins: Number(opts.volRefresh),
+          indices,
+          slugs,
+          patterns,
+          recordPath: opts.record || null,
+        },
+        {
+          info,
+          vol: async (underlying) => {
+            const { fetchCandles } = await import("./candles.js");
+            const { realizedVol } = await import("./fairvalue.js");
+            const now = Date.now();
+            const candles = await fetchCandles(opts.source, info, underlying, "1h", now - 170 * 3_600_000, now);
+            const closes = candles.slice(0, -1).map((c) => Number(c.c));
+            if (closes.length < 48) throw new Error(`only ${closes.length} 1h candles for ${underlying}`);
+            return realizedVol(closes);
+          },
+          notify: (text) => {
+            console.log(`\n${text}`);
+            tg?.send(text);
+          },
+        },
+      );
+      const ac = new AbortController();
+      const stop = () => ac.abort();
+      process.on("SIGINT", stop);
+      process.on("SIGTERM", stop);
+      await maker.run(ac.signal);
+      await tg?.flush();
+      process.exit(0);
     },
   );
 
